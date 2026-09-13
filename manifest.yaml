@@ -14,6 +14,8 @@ description: |
     an existing label by name (e.g. Urgent, High, Medium).
   - **list_recent** — List the most recently created tasks in a project.
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
+paths:
+  base: manifest
 models:
   - extensions/models/vikunja_kanban.ts
 labels:

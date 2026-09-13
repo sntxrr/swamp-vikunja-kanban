@@ -69,22 +69,40 @@ const LabelRefSchema = z.object({
 const VikunjaTaskSchema = z.object({
   id: z.number().describe("Vikunja task id."),
   title: z.string().describe("Task title."),
-  description: z.string().nullable().optional().describe("Task description/body."),
-  done: z.boolean().nullable().optional().describe("Whether the task is marked done."),
-  priority: z.number().nullable().optional().describe("Vikunja numeric priority (0-5)."),
+  description: z.string().nullable().optional().describe(
+    "Task description/body.",
+  ),
+  done: z.boolean().nullable().optional().describe(
+    "Whether the task is marked done.",
+  ),
+  priority: z.number().nullable().optional().describe(
+    "Vikunja numeric priority (0-5).",
+  ),
   labels: z.array(LabelRefSchema).nullable().optional().describe(
     "Labels currently attached to the task.",
   ),
-  due_date: z.string().nullable().optional().describe("ISO 8601 due date, if set."),
+  due_date: z.string().nullable().optional().describe(
+    "ISO 8601 due date, if set.",
+  ),
   project_id: z.number().nullable().optional().describe("Owning project id."),
-  created: z.string().nullable().optional().describe("Creation timestamp from Vikunja."),
-  updated: z.string().nullable().optional().describe("Last-update timestamp from Vikunja."),
-  fetchedAt: z.string().describe("ISO 8601 timestamp when this record was written."),
-  collectedBy: z.string().optional().describe("Extension that collected this data."),
+  created: z.string().nullable().optional().describe(
+    "Creation timestamp from Vikunja.",
+  ),
+  updated: z.string().nullable().optional().describe(
+    "Last-update timestamp from Vikunja.",
+  ),
+  fetchedAt: z.string().describe(
+    "ISO 8601 timestamp when this record was written.",
+  ),
+  collectedBy: z.string().optional().describe(
+    "Extension that collected this data.",
+  ),
 }).passthrough();
 
 const SummarySchema = z.object({
-  scope: z.string().describe('Which listing produced this summary, e.g. "recent".'),
+  scope: z.string().describe(
+    'Which listing produced this summary, e.g. "recent".',
+  ),
   endpoint: z.string().describe("Resolved request path the items came from."),
   total: z.number().describe("Number of items written by this run."),
   ids: z.array(z.number()).default([]),
@@ -96,13 +114,15 @@ const SummarySchema = z.object({
 // ============================================================================
 
 const PriorityLabel = z.enum(["Urgent", "High", "Medium"]).describe(
-  'Label name to attach to the task, resolved via GET /labels. Must ' +
-    'already exist on the Vikunja instance — this model never creates labels.',
+  "Label name to attach to the task, resolved via GET /labels. Must " +
+    "already exist on the Vikunja instance — this model never creates labels.",
 );
 
 const NewTaskArgsSchema = z.object({
   title: z.string().min(1, "title must not be empty").describe("Task title."),
-  description: z.string().optional().describe("Optional task description/body."),
+  description: z.string().optional().describe(
+    "Optional task description/body.",
+  ),
   label: PriorityLabel.optional(),
   dueDate: z.string().optional().describe(
     "Optional ISO 8601 due date, e.g. 2026-09-20T00:00:00Z.",
@@ -151,7 +171,9 @@ interface ExecCtx {
 /** Resolve the API base (no trailing slash) from the configured baseUrl. */
 export function resolveBase(g: GlobalArgs): string {
   const trimmed = g.baseUrl.trim().replace(/\/+$/, "");
-  if (!trimmed) throw new Error("Vikunja `baseUrl` resolves to an empty string.");
+  if (!trimmed) {
+    throw new Error("Vikunja `baseUrl` resolves to an empty string.");
+  }
   if (!/^https?:\/\//i.test(trimmed)) {
     throw new Error(
       `Invalid Vikunja baseUrl "${g.baseUrl}": must start with http:// or https://.`,
@@ -169,7 +191,9 @@ export function backoffMs(res: Response): number {
   const retryAfter = res.headers.get("Retry-After");
   if (retryAfter) {
     const secs = Number(retryAfter);
-    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, 60_000);
+    if (Number.isFinite(secs) && secs >= 0) {
+      return Math.min(secs * 1000, 60_000);
+    }
   }
   return 1_000;
 }
@@ -242,9 +266,12 @@ async function resolveLabelId(
   g: GlobalArgs,
   labelName: string,
 ): Promise<number | null> {
-  const labels = asArray(await vreq(g, "GET", "/labels", { search: { per_page: "100" } }));
+  const labels = asArray(
+    await vreq(g, "GET", "/labels", { search: { per_page: "100" } }),
+  );
   const match = labels.find((l) =>
-    typeof l.title === "string" && l.title.toLowerCase() === labelName.toLowerCase()
+    typeof l.title === "string" &&
+    l.title.toLowerCase() === labelName.toLowerCase()
   );
   return match && typeof match.id === "number" ? match.id : null;
 }
@@ -365,7 +392,9 @@ async function listRecent(
         sort_by: "created",
         order_by: "desc",
         per_page: String(args.limit),
-        ...(args.includeDone ? {} : { filter_by: "done", filter_value: "false" }),
+        ...(args.includeDone
+          ? {}
+          : { filter_by: "done", filter_value: "false" }),
       },
     }),
   ).slice(0, args.limit);
@@ -376,7 +405,11 @@ async function listRecent(
     const id = typeof t.id === "number" ? t.id : null;
     if (id === null) continue;
     handles.push(
-      await ctx.writeResource("vikunjaTask", `list-${id}`, toVikunjaTask(t, fetchedAt)),
+      await ctx.writeResource(
+        "vikunjaTask",
+        `list-${id}`,
+        toVikunjaTask(t, fetchedAt),
+      ),
     );
     ids.push(id);
   }
@@ -404,7 +437,8 @@ export const model = {
   globalArguments: GlobalArgsSchema,
   resources: {
     vikunjaTask: {
-      description: "A Vikunja task with id, title, labels, priority, and status.",
+      description:
+        "A Vikunja task with id, title, labels, priority, and status.",
       schema: VikunjaTaskSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,
