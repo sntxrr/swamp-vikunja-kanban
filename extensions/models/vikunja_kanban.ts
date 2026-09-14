@@ -9,11 +9,17 @@
  *
  * This is a homelab-native replacement for @webframp/hermes-kanban-orchestrator:
  * instead of shelling out to `hermes kanban create`, it talks to Vikunja's
- * REST API directly with fetch. It creates tasks in a fixed project, can
- * attach an existing label by name, and — when a view id is configured —
- * places new tasks into a named bucket (e.g. "Review") within that view so
- * automation-created tasks land somewhere a human triages first, rather than
- * straight into a working column.
+ * REST API directly with fetch. It creates tasks in a project (a configured
+ * default, overridable per call), can attach an existing label by name, and
+ * places each new task into a named kanban bucket (default "Backlog") so
+ * automation-created tasks land in a backlog column rather than wherever
+ * Vikunja's view default points — which, for a view with no default bucket
+ * set, is the lowest-positioned column (typically "Doing").
+ *
+ * The project's kanban view is discovered automatically via
+ * GET /projects/{id}/views (view_kind == "kanban"); no view id needs to be
+ * configured. The bucket is resolved *before* the task is created, so a
+ * misspelled bucket name fails fast with nothing created.
  *
  * @module
  */
@@ -34,22 +40,22 @@ const GlobalArgsSchema = z.object({
       "for the exact vault-get syntax; never inline the raw token here.",
   ),
   projectId: z.number().int().positive().describe(
-    "Vikunja project id tasks are created in and listed from (e.g. the " +
-      "homelab backlog project).",
+    "Default Vikunja project id tasks are created in and listed from (e.g. " +
+      "the homelab backlog project). Override per call with the projectId " +
+      "method argument.",
   ),
   viewId: z.number().int().positive().optional().describe(
-    "Optional Vikunja Kanban view id within the project. When set, " +
-      "new_task resolves a bucket by name within this view (see " +
-      "defaultBucketName / bucketName) and places the created task there. " +
-      "Without a viewId, new tasks land wherever Vikunja's default is " +
-      "(typically the view's first bucket, e.g. a working/doing column) " +
-      "and bucket placement is skipped entirely.",
+    "Optional explicit kanban view id for the default projectId. Normally " +
+      "leave unset: the kanban view is discovered automatically via " +
+      "GET /projects/{id}/views. Only consulted when a call targets the " +
+      "default project; per-call projectId overrides always auto-discover.",
   ),
-  defaultBucketName: z.string().default("Review").describe(
+  defaultBucketName: z.string().default("Backlog").describe(
     "Bucket title (case-insensitive) that new_task places tasks into by " +
-      "default when viewId is set, e.g. so automation-created tasks land " +
-      "in a human triage/review column instead of a working column. " +
-      "Override per-call with the bucketName method argument.",
+      "default, so automation-created tasks land in a backlog column " +
+      "instead of the view's default (typically a working/doing column). " +
+      "Override per call with the bucketName method argument. Set to an " +
+      "empty string to disable bucket placement entirely.",
   ),
   timeoutMs: z.number().int().positive().default(15_000).describe(
     "Per-request fetch timeout in milliseconds.",
@@ -96,6 +102,14 @@ const VikunjaTaskSchema = z.object({
     "Bucket id the task currently sits in, scoped to whichever view last " +
       "placed it.",
   ),
+  placement: z.object({
+    viewId: z.number(),
+    bucketId: z.number(),
+    bucketTitle: z.string(),
+  }).optional().describe(
+    "Kanban bucket this run placed the task into (absent when placement " +
+      "was disabled or the task already existed).",
+  ),
   created: z.string().nullable().optional().describe(
     "Creation timestamp from Vikunja.",
   ),
@@ -129,8 +143,13 @@ const PriorityLabel = z.enum(["Urgent", "High", "Medium"]).describe(
     "already exist on the Vikunja instance — this model never creates labels.",
 );
 
+const ProjectIdOverride = z.number().int().positive().optional().describe(
+  "Target a different Vikunja project than the configured default projectId.",
+);
+
 const NewTaskArgsSchema = z.object({
   title: z.string().min(1, "title must not be empty").describe("Task title."),
+  projectId: ProjectIdOverride,
   description: z.string().optional().describe(
     "Optional task description/body.",
   ),
@@ -142,8 +161,11 @@ const NewTaskArgsSchema = z.object({
     "Optional Vikunja numeric priority override (0=unset .. 5=DO NOW).",
   ),
   bucketName: z.string().optional().describe(
-    "Override the configured defaultBucketName for this call. Requires " +
-      "viewId to be set globally; ignored otherwise.",
+    "Kanban bucket title (case-insensitive) to place the task into, " +
+      "overriding the configured defaultBucketName. Must exist in the " +
+      "target project's kanban view — resolved before the task is created, " +
+      "so an unknown name fails with nothing created. Empty string " +
+      "disables placement for this call.",
   ),
   skipIfTitleExists: z.boolean().default(true).describe(
     "If true (default), checks for a non-done task with the exact same " +
@@ -154,6 +176,7 @@ const NewTaskArgsSchema = z.object({
 type NewTaskArgs = z.infer<typeof NewTaskArgsSchema>;
 
 const ListRecentArgsSchema = z.object({
+  projectId: ProjectIdOverride,
   limit: z.number().int().min(1).max(50).default(10).describe(
     "Max results to return.",
   ),
@@ -292,39 +315,70 @@ async function resolveLabelId(
 }
 
 /**
- * Resolve a bucket name to its Vikunja bucket id within a specific project
- * view via GET /projects/{projectId}/views/{viewId}/buckets.
+ * Find the kanban view of a project via GET /projects/{projectId}/views.
+ * Honors the configured viewId override for the default project only.
+ * Returns null when the project has no kanban view.
  */
-async function resolveBucketId(
+async function resolveKanbanViewId(
   g: GlobalArgs,
+  projectId: number,
+): Promise<number | null> {
+  if (g.viewId !== undefined && projectId === g.projectId) return g.viewId;
+  const views = asArray(await vreq(g, "GET", `/projects/${projectId}/views`));
+  const kanban = views.find((v) => v.view_kind === "kanban");
+  return kanban && typeof kanban.id === "number" ? kanban.id : null;
+}
+
+/**
+ * Resolve a bucket name (case-insensitive) to its id within a view via
+ * GET /projects/{projectId}/views/{viewId}/buckets. Throws listing the
+ * available bucket titles when there is no match, so a typo is actionable.
+ */
+async function resolveBucket(
+  g: GlobalArgs,
+  projectId: number,
   viewId: number,
   bucketName: string,
-): Promise<number | null> {
+): Promise<{ id: number; title: string }> {
   const buckets = asArray(
-    await vreq(g, "GET", `/projects/${g.projectId}/views/${viewId}/buckets`),
+    await vreq(g, "GET", `/projects/${projectId}/views/${viewId}/buckets`),
   );
   const match = buckets.find((b) =>
     typeof b.title === "string" &&
     b.title.toLowerCase() === bucketName.toLowerCase()
   );
-  return match && typeof match.id === "number" ? match.id : null;
+  if (
+    match && typeof match.id === "number" && typeof match.title === "string"
+  ) {
+    return { id: match.id, title: match.title };
+  }
+  const available = buckets
+    .map((b) => (typeof b.title === "string" ? `"${b.title}"` : null))
+    .filter((t): t is string => t !== null)
+    .join(", ");
+  throw new Error(
+    `Bucket "${bucketName}" not found in project ${projectId} view ${viewId}` +
+      (available ? `; available: ${available}` : "; the view has no buckets"),
+  );
 }
 
 /**
  * Move a task into a bucket within a view via
- * PUT /projects/{projectId}/views/{viewId}/buckets/{bucketId}/tasks.
+ * POST /projects/{projectId}/views/{viewId}/buckets/{bucketId}/tasks
+ * (the "Update a task bucket" endpoint; Vikunja >= 0.24 / v2.x).
  */
 async function moveTaskToBucket(
   g: GlobalArgs,
+  projectId: number,
   viewId: number,
   bucketId: number,
   taskId: number,
 ): Promise<void> {
   await vreq(
     g,
-    "PUT",
-    `/projects/${g.projectId}/views/${viewId}/buckets/${bucketId}/tasks`,
-    { body: { task_id: taskId } },
+    "POST",
+    `/projects/${projectId}/views/${viewId}/buckets/${bucketId}/tasks`,
+    { body: { task_id: taskId, bucket_id: bucketId, project_view_id: viewId } },
   );
 }
 
@@ -349,10 +403,11 @@ async function newTask(
 ): Promise<{ dataHandles: unknown[] }> {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
 
   if (args.skipIfTitleExists) {
     const existing = asArray(
-      await vreq(g, "GET", `/projects/${g.projectId}/tasks`, {
+      await vreq(g, "GET", `/projects/${projectId}/tasks`, {
         search: { s: args.title, per_page: "50" },
       }),
     );
@@ -364,7 +419,7 @@ async function newTask(
     if (dup && typeof dup.id === "number") {
       ctx.logger?.info(
         "Task with matching title already exists \u2014 skipping create",
-        { title: args.title, existingId: dup.id },
+        { title: args.title, existingId: dup.id, projectId },
       );
       const handle = await ctx.writeResource(
         "vikunjaTask",
@@ -372,6 +427,25 @@ async function newTask(
         toVikunjaTask(dup, fetchedAt),
       );
       return { dataHandles: [handle] };
+    }
+  }
+
+  // Resolve the destination bucket up front: an unknown bucket name must
+  // fail here, before anything is created, rather than leave a task sitting
+  // in the view's default column.
+  const bucketName = args.bucketName ?? g.defaultBucketName;
+  let target: { viewId: number; bucketId: number; bucketTitle: string } | null =
+    null;
+  if (bucketName) {
+    const viewId = await resolveKanbanViewId(g, projectId);
+    if (viewId === null) {
+      ctx.logger?.warning(
+        "Project has no kanban view \u2014 skipping bucket placement",
+        { projectId, bucketName },
+      );
+    } else {
+      const bucket = await resolveBucket(g, projectId, viewId, bucketName);
+      target = { viewId, bucketId: bucket.id, bucketTitle: bucket.title };
     }
   }
 
@@ -383,7 +457,7 @@ async function newTask(
   const created = await vreq(
     g,
     "PUT",
-    `/projects/${g.projectId}/tasks`,
+    `/projects/${projectId}/tasks`,
     { body },
   ) as Record<string, unknown>;
 
@@ -416,40 +490,29 @@ async function newTask(
     }
   }
 
-  if (g.viewId !== undefined) {
-    const bucketName = args.bucketName ?? g.defaultBucketName;
-    if (bucketName) {
-      try {
-        const bucketId = await resolveBucketId(g, g.viewId, bucketName);
-        if (bucketId === null) {
-          ctx.logger?.warning(
-            "Requested bucket not found in this view \u2014 task created in the " +
-              "view's default bucket instead",
-            { bucketName, viewId: g.viewId, taskId },
-          );
-        } else {
-          await moveTaskToBucket(g, g.viewId, bucketId, taskId);
-          ctx.logger?.info(
-            `Placed task ${taskId} into bucket "${bucketName}"`,
-            {
-              bucketId,
-              viewId: g.viewId,
-            },
-          );
-        }
-      } catch (e) {
-        ctx.logger?.warning(
-          "Failed to place task into bucket \u2014 task was still created " +
-            "successfully in the view's default bucket",
-          {
-            taskId,
-            bucketName,
-            viewId: g.viewId,
-            error: e instanceof Error ? e.message : String(e),
-          },
-        );
-      }
+  if (target) {
+    try {
+      await moveTaskToBucket(
+        g,
+        projectId,
+        target.viewId,
+        target.bucketId,
+        taskId,
+      );
+    } catch (e) {
+      // The task exists but sits in the view's default column — surface
+      // that loudly rather than report success for a misplaced task.
+      throw new Error(
+        `Task ${taskId} was created in project ${projectId} but could not ` +
+          `be moved into bucket "${target.bucketTitle}" ` +
+          `(view ${target.viewId}, bucket ${target.bucketId}): ` +
+          (e instanceof Error ? e.message : String(e)),
+      );
     }
+    ctx.logger?.info(
+      `Placed task ${taskId} into bucket "${target.bucketTitle}"`,
+      { projectId, viewId: target.viewId, bucketId: target.bucketId },
+    );
   }
 
   const final = await vreq(g, "GET", `/tasks/${taskId}`) as Record<
@@ -460,9 +523,16 @@ async function newTask(
   const handle = await ctx.writeResource(
     "vikunjaTask",
     `task-${taskId}`,
-    toVikunjaTask(final, fetchedAt),
+    toVikunjaTask(
+      target ? { ...final, placement: target } : final,
+      fetchedAt,
+    ),
   );
-  ctx.logger?.info(`Vikunja task created: ${taskId}`, { title: args.title });
+  ctx.logger?.info(`Vikunja task created: ${taskId}`, {
+    title: args.title,
+    projectId,
+    bucket: target?.bucketTitle ?? null,
+  });
   return { dataHandles: [handle] };
 }
 
@@ -472,7 +542,8 @@ async function listRecent(
 ): Promise<{ dataHandles: unknown[] }> {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = new Date().toISOString();
-  const endpoint = `/projects/${g.projectId}/tasks`;
+  const projectId = args.projectId ?? g.projectId;
+  const endpoint = `/projects/${projectId}/tasks`;
 
   const tasks = asArray(
     await vreq(g, "GET", endpoint, {
@@ -521,7 +592,7 @@ async function listRecent(
 /** Vikunja kanban orchestrator: create and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.13.2",
+  version: "2026.09.14.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -533,6 +604,21 @@ export const model = {
         "triage column instead of a working column. Added bucket_id to the " +
         "vikunjaTask resource schema. No breaking changes — both new fields " +
         "are optional/defaulted.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.14.1",
+      description:
+        "Bucket placement now works without a configured viewId: the " +
+        "project's kanban view is auto-discovered, the bucket is resolved " +
+        "before the task is created (unknown name = error, nothing " +
+        "created), the move uses the POST endpoint Vikunja v2.x serves " +
+        "(the previous PUT silently failed), and a failed move is an error " +
+        "instead of a warning. defaultBucketName default changed from " +
+        '"Review" to "Backlog". Added optional projectId argument to ' +
+        "new_task and list_recent to target another project per call, " +
+        "and a placement field on the vikunjaTask resource. Existing " +
+        "model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -554,18 +640,21 @@ export const model = {
   methods: {
     new_task: {
       description:
-        "Create a task in the configured Vikunja project, optionally attaching " +
-        "an existing label by name (Urgent/High/Medium), skipping creation if " +
-        "a non-done task with the same title already exists, and — when " +
-        "viewId is configured — placing the task into a named bucket (default " +
-        '"Review") so it lands for human triage rather than a working column.',
+        "Create a task in a Vikunja project (the configured default, or a " +
+        "per-call projectId) and place it into a named kanban bucket " +
+        '(default "Backlog", override with bucketName) so it lands in a ' +
+        "backlog column rather than the view's default working column. " +
+        "Optionally attaches an existing label by name (Urgent/High/Medium) " +
+        "and skips creation if a non-done task with the same title already " +
+        "exists.",
       arguments: NewTaskArgsSchema,
       execute: newTask,
     },
     list_recent: {
       description:
-        "List the most recently created tasks in the configured Vikunja " +
-        "project and record each as swamp data.",
+        "List the most recently created tasks in a Vikunja project (the " +
+        "configured default, or a per-call projectId) and record each as " +
+        "swamp data.",
       arguments: ListRecentArgsSchema,
       execute: listRecent,
     },

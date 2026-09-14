@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.09.13.2"
+version: "2026.09.14.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -8,16 +8,18 @@ description: |
   @webframp/hermes-kanban-orchestrator: no hermes binary, no shell-out — just
   an authenticated HTTP client talking to a self-hosted Vikunja instance.
 
-  When a Kanban view id is configured, new tasks are placed into a named
-  bucket (default "Review") within that view, so automation-created tasks
-  land in a human triage/review column rather than straight into a working
-  column.
+  New tasks are placed into a named kanban bucket (default "Backlog") of the
+  target project — the kanban view is discovered automatically — so
+  automation-created tasks land in a backlog column rather than the view's
+  default working column. The bucket is resolved before the task is created,
+  so an unknown bucket name fails with nothing created. Any project can be
+  targeted per call via a projectId argument.
 
   ## Methods
 
-  - **new_task** — Create a task in a Vikunja project, optionally attaching
-    an existing label by name (e.g. Urgent, High, Medium) and placing it in
-    a named bucket within a configured view.
+  - **new_task** — Create a task in a Vikunja project (default or per-call
+    projectId), placing it in a named bucket (bucketName) and optionally
+    attaching an existing label by name (e.g. Urgent, High, Medium).
   - **list_recent** — List the most recently created tasks in a project.
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
 paths:
