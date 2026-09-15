@@ -34,7 +34,7 @@ const GlobalArgsSchema = z.object({
     "Base URL of the Vikunja instance, e.g. https://vikunja.example.com " +
       "(no trailing slash, no /api/v1 suffix \u2014 that's added automatically).",
   ),
-  apiToken: z.string().min(1).describe(
+  apiToken: z.string().min(1).meta({ sensitive: true }).describe(
     "Vikunja personal API token (Bearer). Supply via a swamp vault " +
       "reference in the model definition's globalArguments — see README " +
       "for the exact vault-get syntax; never inline the raw token here.",
