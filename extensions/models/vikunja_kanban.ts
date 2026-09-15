@@ -57,6 +57,66 @@ const GlobalArgsSchema = z.object({
       "Override per call with the bucketName method argument. Set to an " +
       "empty string to disable bucket placement entirely.",
   ),
+  bucketRoles: z.object({
+    backlog: z.string().default("Backlog"),
+    ready: z.string().default("Next"),
+    doing: z.string().default("Doing"),
+    blocked: z.string().default("Blocked"),
+    review: z.string().default("Review"),
+    done: z.string().default("Done"),
+  }).prefault({}).describe(
+    "Which bucket title (case-insensitive) plays which role on the board. " +
+      "audit and reorder scope their rules by role: the ready column must " +
+      "pass the full Definition of Ready, doing/review/blocked have " +
+      "staleness thresholds, done is never reordered.",
+  ),
+  policy: z.object({
+    wipLimit: z.number().int().min(1).default(3).describe(
+      "Maximum cards in the doing bucket before audit reports wip-exceeded.",
+    ),
+    staleDays: z.object({
+      ready: z.number().default(14),
+      doing: z.number().default(7),
+      blocked: z.number().default(1),
+      review: z.number().default(3),
+    }).prefault({}).describe(
+      "Days since `updated` after which a card in that role is reported stale.",
+    ),
+    minDescriptionChars: z.number().int().min(0).default(400).describe(
+      "Descriptions shorter than this (HTML stripped) are reported as stubs.",
+    ),
+    verdictMarkers: z.array(z.string()).default([
+      "CONFIRMED",
+      "DISSOLVED",
+      "MISSTATED",
+    ]).describe(
+      "A ready card's description must contain one of these premise-check " +
+        "verdicts (case-sensitive substring match).",
+    ),
+    acceptanceMarkers: z.array(z.string()).default([
+      "Acceptance",
+      "Proof",
+      "Done when",
+      "Verify",
+    ]).describe(
+      "A ready card's description must contain one of these (case-insensitive) " +
+        "— the marker of an acceptance criterion with a command and expected output.",
+    ),
+    requiredLinkPrefix: z.string().default("obsidian://").describe(
+      "Every non-done card should link back to its source note with a URL " +
+        "starting with this prefix. Empty string disables the check.",
+    ),
+    requiredLabelPrefixes: z.array(z.string()).default(["tier-"]).describe(
+      "Label-group prefixes every non-done card must carry one of (e.g. " +
+        "tier-A/B/C). Any label NOT matching a prefix counts as the area label.",
+    ),
+    tieBreak: z.enum(["oldest", "newest"]).default("oldest").describe(
+      "Within equal priority, whether older or newer cards sort first.",
+    ),
+  }).prefault({}).describe(
+    "Definition-of-Ready thresholds used by audit and the sort order used " +
+      "by reorder. Every field has a default; override only what differs.",
+  ),
   timeoutMs: z.number().int().positive().default(15_000).describe(
     "Per-request fetch timeout in milliseconds.",
   ),
@@ -134,13 +194,77 @@ const SummarySchema = z.object({
   fetchedAt: z.string(),
 }).passthrough();
 
+const FindingSchema = z.object({
+  taskId: z.number().nullable().describe(
+    "Task the finding is about; null for bucket-level findings.",
+  ),
+  title: z.string().nullable(),
+  bucket: z.string(),
+  role: z.string().describe(
+    "Bucket role (backlog/ready/doing/blocked/review/done/other).",
+  ),
+  rule: z.string().describe(
+    "Rule id, e.g. empty-description, stale, wip-exceeded.",
+  ),
+  severity: z.enum(["error", "warn", "info"]),
+  detail: z.string(),
+});
+type Finding = z.infer<typeof FindingSchema>;
+
+const BoardAuditSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  auditedAt: z.string(),
+  buckets: z.array(z.object({
+    title: z.string(),
+    role: z.string(),
+    count: z.number(),
+    inOrder: z.boolean(),
+  })),
+  findings: z.array(FindingSchema),
+  counts: z.object({
+    findings: z.number(),
+    bySeverity: z.record(z.string(), z.number()),
+    byRule: z.record(z.string(), z.number()),
+  }),
+  ready: z.object({
+    bucket: z.string(),
+    total: z.number(),
+    passing: z.number(),
+    failingIds: z.array(z.number()),
+  }).describe(
+    "Definition-of-Ready roll-up for the ready column: a card passes when " +
+      "it has no error-level findings.",
+  ),
+}).passthrough();
+
+const ReorderPlanSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  plannedAt: z.string(),
+  applied: z.boolean(),
+  converged: z.boolean().describe(
+    "True when the final re-read of every bucket matched the intended " +
+      "order (always false on a dry run that still has pending moves).",
+  ),
+  iterations: z.number(),
+  moves: z.array(z.object({
+    taskId: z.number(),
+    title: z.string(),
+    bucket: z.string(),
+    from: z.number().describe("0-based index before."),
+    to: z.number().describe("0-based index after."),
+  })),
+}).passthrough();
+
 // ============================================================================
 // Method argument schemas
 // ============================================================================
 
-const PriorityLabel = z.enum(["Urgent", "High", "Medium"]).describe(
-  "Label name to attach to the task, resolved via GET /labels. Must " +
-    "already exist on the Vikunja instance — this model never creates labels.",
+const LabelName = z.string().min(1).describe(
+  "Label title to attach to the task (case-insensitive), resolved via " +
+    "GET /labels. Must already exist on the Vikunja instance — this model " +
+    "never creates labels.",
 );
 
 const ProjectIdOverride = z.number().int().positive().optional().describe(
@@ -153,7 +277,7 @@ const NewTaskArgsSchema = z.object({
   description: z.string().optional().describe(
     "Optional task description/body.",
   ),
-  label: PriorityLabel.optional(),
+  label: LabelName.optional(),
   dueDate: z.string().optional().describe(
     "Optional ISO 8601 due date, e.g. 2026-09-20T00:00:00Z.",
   ),
@@ -174,6 +298,28 @@ const NewTaskArgsSchema = z.object({
   ),
 });
 type NewTaskArgs = z.infer<typeof NewTaskArgsSchema>;
+
+const AuditArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+});
+
+const ReorderArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+  apply: z.boolean().default(false).describe(
+    "false (default) only reports the moves that would be made. true " +
+      "performs them one at a time — read the bucket, move the first card " +
+      "that is out of place to the midpoint of its intended neighbours, " +
+      "re-read, repeat — and fails if the board has not converged.",
+  ),
+  buckets: z.array(z.string()).optional().describe(
+    "Bucket titles (case-insensitive) to reorder. Default: every bucket " +
+      "except the done role.",
+  ),
+  maxIterations: z.number().int().min(1).max(500).default(100).describe(
+    "Upper bound on single-card moves before reorder gives up.",
+  ),
+});
+type ReorderArgs = z.infer<typeof ReorderArgsSchema>;
 
 const ListRecentArgsSchema = z.object({
   projectId: ProjectIdOverride,
@@ -586,13 +732,516 @@ async function listRecent(
 }
 
 // ============================================================================
+// Board reading and Definition-of-Ready rules
+// ============================================================================
+
+/** The subset of a Vikunja task the audit/reorder rules look at. */
+export interface BoardTask {
+  id: number;
+  title: string;
+  description: string;
+  done: boolean;
+  priority: number;
+  position: number;
+  created: string;
+  updated: string;
+  labels: string[];
+}
+
+export interface BoardBucket {
+  id: number;
+  title: string;
+  position: number;
+  tasks: BoardTask[];
+}
+
+type Roles = GlobalArgs["bucketRoles"];
+type Policy = GlobalArgs["policy"];
+export type Role = keyof Roles | "other";
+
+/** Map a bucket title to its configured role (case-insensitive). */
+export function roleOf(title: string, roles: Roles): Role {
+  const t = title.toLowerCase();
+  for (const [role, name] of Object.entries(roles)) {
+    if (name.toLowerCase() === t) return role as Role;
+  }
+  return "other";
+}
+
+/** Visible text length of a description: HTML tags stripped, whitespace trimmed. */
+export function textLength(html: string): number {
+  return html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").trim()
+    .replace(/\s+/g, " ").length;
+}
+
+function toBoardTask(raw: Record<string, unknown>): BoardTask | null {
+  if (typeof raw.id !== "number") return null;
+  return {
+    id: raw.id,
+    title: typeof raw.title === "string" ? raw.title : "",
+    description: typeof raw.description === "string" ? raw.description : "",
+    done: raw.done === true,
+    priority: typeof raw.priority === "number" ? raw.priority : 0,
+    position: typeof raw.position === "number" ? raw.position : 0,
+    created: typeof raw.created === "string" ? raw.created : "",
+    updated: typeof raw.updated === "string" ? raw.updated : "",
+    labels: asArray(raw.labels).map((l) => l.title).filter((t): t is string =>
+      typeof t === "string"
+    ),
+  };
+}
+
+/**
+ * Read a whole kanban board via GET /projects/{p}/views/{v}/tasks. The
+ * endpoint paginates *per bucket* (page size from /info), so a single page
+ * silently truncates any bucket longer than that limit. Keep fetching pages
+ * until no bucket gains a task; tasks are ordered by their view position.
+ */
+async function fetchBoard(
+  g: GlobalArgs,
+  projectId: number,
+  viewId: number,
+): Promise<BoardBucket[]> {
+  const info = await vreq(g, "GET", "/info").catch(() => null) as
+    | Record<string, unknown>
+    | null;
+  const perPage = info && typeof info.max_items_per_page === "number"
+    ? info.max_items_per_page
+    : 50;
+
+  const buckets = new Map<number, BoardBucket>();
+  for (let page = 1; page <= 100; page++) {
+    const raw = asArray(
+      await vreq(g, "GET", `/projects/${projectId}/views/${viewId}/tasks`, {
+        search: { page: String(page), per_page: String(perPage) },
+      }),
+    );
+    let grew = false;
+    for (const b of raw) {
+      if (typeof b.id !== "number") continue;
+      const bucket = buckets.get(b.id) ?? {
+        id: b.id,
+        title: typeof b.title === "string" ? b.title : String(b.id),
+        position: typeof b.position === "number" ? b.position : 0,
+        tasks: [],
+      };
+      const seen = new Set(bucket.tasks.map((t) => t.id));
+      for (const t of asArray(b.tasks)) {
+        const task = toBoardTask(t);
+        if (task && !seen.has(task.id)) {
+          bucket.tasks.push(task);
+          seen.add(task.id);
+          grew = true;
+        }
+      }
+      buckets.set(b.id, bucket);
+    }
+    if (!grew) break;
+  }
+  const out = [...buckets.values()].sort((a, b) => a.position - b.position);
+  for (const b of out) b.tasks.sort((a, c) => a.position - c.position);
+  return out;
+}
+
+/**
+ * The order a bucket should be in: priority descending (5 = DO NOW first,
+ * 0 = unset last), then by age. Stable, so already-ordered input is
+ * returned unchanged.
+ */
+export function intendedOrder(
+  tasks: BoardTask[],
+  tieBreak: Policy["tieBreak"],
+): BoardTask[] {
+  return [...tasks].sort((a, b) => {
+    if (a.priority !== b.priority) return b.priority - a.priority;
+    const cmp = a.created.localeCompare(b.created);
+    return tieBreak === "oldest" ? cmp : -cmp;
+  });
+}
+
+function sameOrder(a: BoardTask[], b: BoardTask[]): boolean {
+  return a.length === b.length && a.every((t, i) => t.id === b[i].id);
+}
+
+function daysBetween(fromIso: string, now: Date): number | null {
+  const t = Date.parse(fromIso);
+  if (!Number.isFinite(t)) return null;
+  return (now.getTime() - t) / 86_400_000;
+}
+
+/**
+ * Findings for one card, scoped by the role of the bucket it sits in. The
+ * full Definition of Ready is only *required* (error) in the ready column
+ * and in doing/review — anywhere a card is meant to be executed from —
+ * and reported as warn/info elsewhere so the backlog can be groomed toward it.
+ */
+export function auditCard(
+  task: BoardTask,
+  bucket: string,
+  role: Role,
+  policy: Policy,
+  now: Date,
+): Finding[] {
+  const out: Finding[] = [];
+  const add = (rule: string, severity: Finding["severity"], detail: string) =>
+    out.push({
+      taskId: task.id,
+      title: task.title,
+      bucket,
+      role,
+      rule,
+      severity,
+      detail,
+    });
+
+  if (role === "done") {
+    if (!task.done) {
+      add("done-flag-mismatch", "warn", "in the done bucket but done=false");
+    }
+    return out;
+  }
+  if (task.done) {
+    add("done-flag-mismatch", "warn", "done=true outside the done bucket");
+  }
+
+  const executable = role === "ready" || role === "doing" || role === "review";
+  const must: Finding["severity"] = executable ? "error" : "warn";
+
+  const len = textLength(task.description);
+  if (len === 0) add("empty-description", "error", "description is empty");
+  else if (len < policy.minDescriptionChars) {
+    add(
+      "short-description",
+      must,
+      `${len} chars < ${policy.minDescriptionChars}`,
+    );
+  }
+
+  if (task.labels.length === 0) add("no-labels", must, "no labels at all");
+  else {
+    for (const prefix of policy.requiredLabelPrefixes) {
+      if (
+        !task.labels.some((l) =>
+          l.toLowerCase().startsWith(prefix.toLowerCase())
+        )
+      ) {
+        add("missing-label-group", must, `no label starting with "${prefix}"`);
+      }
+    }
+    const isGroup = (l: string) =>
+      policy.requiredLabelPrefixes.some((p) =>
+        l.toLowerCase().startsWith(p.toLowerCase())
+      );
+    if (!task.labels.some((l) => !isGroup(l))) {
+      add("missing-area-label", must, "only group labels, no area label");
+    }
+  }
+
+  if (task.priority === 0) add("priority-unset", must, "priority is 0 (unset)");
+
+  if (len > 0) {
+    const desc = task.description;
+    if (!policy.verdictMarkers.some((m) => desc.includes(m))) {
+      add(
+        "missing-verdict",
+        executable ? "error" : "info",
+        `no premise-check verdict (${policy.verdictMarkers.join("/")})`,
+      );
+    }
+    const lower = desc.toLowerCase();
+    if (
+      !policy.acceptanceMarkers.some((m) => lower.includes(m.toLowerCase()))
+    ) {
+      add(
+        "missing-acceptance",
+        executable ? "error" : "info",
+        `no acceptance marker (${policy.acceptanceMarkers.join("/")})`,
+      );
+    }
+    if (
+      policy.requiredLinkPrefix && !desc.includes(policy.requiredLinkPrefix)
+    ) {
+      add(
+        "missing-link",
+        must,
+        `no ${policy.requiredLinkPrefix} link to the source note`,
+      );
+    }
+  }
+
+  const staleAfter =
+    (policy.staleDays as Record<string, number | undefined>)[role];
+  if (staleAfter !== undefined) {
+    const age = daysBetween(task.updated, now);
+    if (age !== null && age > staleAfter) {
+      add(
+        "stale",
+        "warn",
+        `untouched for ${
+          age.toFixed(1)
+        } d (limit ${staleAfter} d in ${bucket})`,
+      );
+    }
+  }
+  return out;
+}
+
+/** Bucket-level findings: WIP limit and ordering. */
+export function auditBucket(
+  bucket: BoardBucket,
+  role: Role,
+  policy: Policy,
+): { findings: Finding[]; inOrder: boolean } {
+  const findings: Finding[] = [];
+  const inOrder = role === "done" ||
+    sameOrder(bucket.tasks, intendedOrder(bucket.tasks, policy.tieBreak));
+  if (!inOrder) {
+    findings.push({
+      taskId: null,
+      title: null,
+      bucket: bucket.title,
+      role,
+      rule: "out-of-order",
+      severity: "warn",
+      detail: "not sorted by priority desc, then age — run reorder",
+    });
+  }
+  if (role === "doing" && bucket.tasks.length > policy.wipLimit) {
+    findings.push({
+      taskId: null,
+      title: null,
+      bucket: bucket.title,
+      role,
+      rule: "wip-exceeded",
+      severity: "warn",
+      detail: `${bucket.tasks.length} cards > wipLimit ${policy.wipLimit}`,
+    });
+  }
+  return { findings, inOrder };
+}
+
+/**
+ * The single move that brings a bucket one step closer to `intended`: the
+ * first slot whose occupant is wrong gets the card that belongs there,
+ * positioned at the midpoint of its new neighbours. Returns null when the
+ * bucket is already in order.
+ */
+export function nextMove(
+  current: BoardTask[],
+  intended: BoardTask[],
+): { task: BoardTask; index: number; position: number } | null {
+  for (let i = 0; i < intended.length; i++) {
+    if (current[i]?.id === intended[i].id) continue;
+    const task = intended[i];
+    const lo = i > 0 ? current[i - 1].position : 0;
+    const hi = current[i]?.position ?? lo + 65_536;
+    // Vikunja re-derives positions on write, so a collapsed gap is not
+    // fatal — nudge past `lo` and let the re-read decide.
+    const position = hi > lo ? (lo + hi) / 2 : lo + 1;
+    return { task, index: i, position };
+  }
+  return null;
+}
+
+async function requireKanbanView(
+  g: GlobalArgs,
+  projectId: number,
+): Promise<number> {
+  const viewId = await resolveKanbanViewId(g, projectId);
+  if (viewId === null) {
+    throw new Error(`Project ${projectId} has no kanban view.`);
+  }
+  return viewId;
+}
+
+async function audit(
+  args: z.infer<typeof AuditArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const now = new Date();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+
+  const findings: Finding[] = [];
+  const buckets: z.infer<typeof BoardAuditSchema>["buckets"] = [];
+  const ready = {
+    bucket: g.bucketRoles.ready,
+    total: 0,
+    passing: 0,
+    failingIds: [] as number[],
+  };
+
+  for (const b of board) {
+    const role = roleOf(b.title, g.bucketRoles);
+    const { findings: bf, inOrder } = auditBucket(b, role, g.policy);
+    findings.push(...bf);
+    buckets.push({ title: b.title, role, count: b.tasks.length, inOrder });
+    for (const t of b.tasks) {
+      const cf = auditCard(t, b.title, role, g.policy, now);
+      findings.push(...cf);
+      if (role === "ready") {
+        ready.total++;
+        if (cf.some((f) => f.severity === "error")) ready.failingIds.push(t.id);
+        else ready.passing++;
+      }
+    }
+  }
+
+  const bySeverity: Record<string, number> = {};
+  const byRule: Record<string, number> = {};
+  for (const f of findings) {
+    bySeverity[f.severity] = (bySeverity[f.severity] ?? 0) + 1;
+    byRule[f.rule] = (byRule[f.rule] ?? 0) + 1;
+  }
+
+  const report = BoardAuditSchema.parse({
+    projectId,
+    viewId,
+    auditedAt: now.toISOString(),
+    buckets,
+    findings,
+    counts: { findings: findings.length, bySeverity, byRule },
+    ready,
+  });
+  const handle = await ctx.writeResource(
+    "boardAudit",
+    `audit-${projectId}`,
+    report,
+  );
+  ctx.logger?.info(
+    `Audited project ${projectId}: ${
+      buckets.reduce((n, b) => n + b.count, 0)
+    } cards, ` +
+      `${findings.length} findings, ready ${ready.passing}/${ready.total}`,
+    { bySeverity, byRule },
+  );
+  return { dataHandles: [handle] };
+}
+
+async function reorder(
+  args: ReorderArgs,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const plannedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+
+  const wanted = args.buckets?.map((b) => b.toLowerCase());
+  const inScope = (title: string) =>
+    wanted
+      ? wanted.includes(title.toLowerCase())
+      : roleOf(title, g.bucketRoles) !== "done";
+
+  let board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  if (wanted) {
+    const titles = board.map((b) => b.title.toLowerCase());
+    const missing = wanted.filter((w) => !titles.includes(w));
+    if (missing.length) {
+      throw new Error(`Unknown bucket(s): ${missing.join(", ")}`);
+    }
+  }
+
+  // Dry-run plan: where each out-of-place card sits now vs. where it belongs.
+  const moves: z.infer<typeof ReorderPlanSchema>["moves"] = [];
+  for (const b of board) {
+    if (!inScope(b.title)) continue;
+    const intended = intendedOrder(b.tasks, g.policy.tieBreak);
+    b.tasks.forEach((t, from) => {
+      const to = intended.findIndex((x) => x.id === t.id);
+      if (to !== from) {
+        moves.push({ taskId: t.id, title: t.title, bucket: b.title, from, to });
+      }
+    });
+  }
+
+  let iterations = 0;
+  let converged = moves.length === 0;
+  if (args.apply && moves.length > 0) {
+    for (
+      const bucketTitle of board.filter((b) => inScope(b.title)).map((b) =>
+        b.title
+      )
+    ) {
+      for (;;) {
+        const b = board.find((x) => x.title === bucketTitle);
+        if (!b) {
+          throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
+        }
+        const move = nextMove(
+          b.tasks,
+          intendedOrder(b.tasks, g.policy.tieBreak),
+        );
+        if (!move) break;
+        if (iterations >= args.maxIterations) {
+          throw new Error(
+            `reorder did not converge after ${iterations} moves (bucket "${bucketTitle}" still out of order).`,
+          );
+        }
+        iterations++;
+        await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
+          body: {
+            project_view_id: viewId,
+            task_id: move.task.id,
+            position: move.position,
+          },
+        });
+        ctx.logger?.info(
+          `Moved #${move.task.id} to slot ${move.index} in "${bucketTitle}"`,
+          { position: move.position },
+        );
+        // Vikunja may not store the exact number sent — always re-read.
+        board = await fetchBoard(g, projectId, viewId);
+      }
+    }
+    converged = board.filter((b) => inScope(b.title)).every((b) =>
+      sameOrder(b.tasks, intendedOrder(b.tasks, g.policy.tieBreak))
+    );
+    if (!converged) {
+      throw new Error(
+        "reorder finished its moves but a final re-read is still out of order.",
+      );
+    }
+  }
+
+  const plan = ReorderPlanSchema.parse({
+    projectId,
+    viewId,
+    plannedAt,
+    applied: args.apply,
+    converged,
+    iterations,
+    moves,
+  });
+  const handle = await ctx.writeResource(
+    "reorderPlan",
+    `reorder-${projectId}`,
+    plan,
+  );
+  ctx.logger?.info(
+    args.apply
+      ? `Reordered project ${projectId}: ${iterations} moves, converged=${converged}`
+      : `Dry run for project ${projectId}: ${moves.length} card(s) out of place (apply: true to fix)`,
+  );
+  return { dataHandles: [handle] };
+}
+
+// ============================================================================
 // Model
 // ============================================================================
 
 /** Vikunja kanban orchestrator: create and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.14.1",
+  version: "2026.09.15.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -621,6 +1270,19 @@ export const model = {
         "model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.09.15.1",
+      description:
+        "Added audit (read-only Definition-of-Ready findings per card and " +
+        "bucket, written as a boardAudit resource) and reorder (sorts every " +
+        "non-done bucket by priority desc then age; dry-run by default, " +
+        "apply: true moves one card at a time and re-reads until the board " +
+        "converges), plus bucketRoles and policy global args with defaults " +
+        "for both. new_task's label argument now accepts any existing label " +
+        "title instead of the Urgent/High/Medium enum. Existing model " +
+        "attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     vikunjaTask: {
@@ -636,8 +1298,45 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 20,
     },
+    boardAudit: {
+      description: "One audit run of a kanban board: per-card and per-bucket " +
+        "Definition-of-Ready findings, counts by rule and severity, and the " +
+        "ready-column pass/fail roll-up.",
+      schema: BoardAuditSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    reorderPlan: {
+      description:
+        "One reorder run: the moves planned (dry run) or performed " +
+        "(apply), and whether the board converged to the intended order.",
+      schema: ReorderPlanSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
   },
   methods: {
+    audit: {
+      description:
+        "Read-only Definition-of-Ready audit of a project's kanban board: " +
+        "empty/short descriptions, missing labels or label groups, unset " +
+        "priority, missing verdict/acceptance/source-link markers, stale " +
+        "cards per role, WIP over the limit, and buckets out of order. " +
+        "Writes a boardAudit resource; changes nothing.",
+      arguments: AuditArgsSchema,
+      execute: audit,
+    },
+    reorder: {
+      description:
+        "Sort each non-done bucket by priority (desc) then age. Dry run by " +
+        "default — reports the cards out of place. With apply: true, moves " +
+        "one card at a time to the midpoint of its intended neighbours and " +
+        "re-reads the board after every move (Vikunja re-derives positions " +
+        "on write, so batch-assigned positions drift), failing loudly if " +
+        "the board does not converge.",
+      arguments: ReorderArgsSchema,
+      execute: reorder,
+    },
     new_task: {
       description:
         "Create a task in a Vikunja project (the configured default, or a " +
