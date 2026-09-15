@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.09.15.1",
+  "reviewedAt": "2026-09-15T18:40:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "apiToken is meta({sensitive:true}) and documented as vault-only. vreq never includes the token in thrown errors or logs; error bodies are sliced to 300 chars of the server response. No other secret-shaped fields."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Structured info/warning logs with ids, counts and bucket names; per-move log in reorder apply; no descriptions or tokens logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Non-2xx throws with method+path+status. reorder throws on unknown bucket names before any write, on maxIterations, and when the final re-read is still out of order. audit throws on a project with no kanban view or no buckets rather than reporting an empty board as clean."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "12 deno tests cover the pure rules: role mapping, HTML text length, every audit rule and its role-scoped severity, label groups, staleness thresholds, done-flag mismatch, sort order both tie-breaks, bucket WIP/order findings, nextMove midpoint and collapsed-gap fallback. No mocked-HTTP tests; the HTTP path was exercised live against a 55-card board (audit: 104 findings; reorder apply: 30 moves, converged, second dry run 0 moves)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "audit is read-only. reorder converges to a fixed point: a re-run after apply plans zero moves. 429 retried with Retry-After up to maxRetries; per-request AbortController timeout."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Never uses POST /tasks/{id} (a full replace in Vikunja). Positions set via POST /tasks/{id}/position with project_view_id. Board read via /projects/{p}/views/{v}/tasks paginated per bucket with page size from /info and a no-growth stop, because one page silently truncates long buckets. Bucket tasks may be null; handled."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "fetch bodies cancelled on retry; timers cleared in finally; page loop bounded at 100 pages; reorder bounded by maxIterations (max 500)."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Archive is the model file, README and LICENSE only; the test file is not packaged. README uses vikunja.example.com; no internal hostnames, ids or vault names in packaged files."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Method args are strict zod objects with defaults and bounds (apply defaults false; maxIterations 1..500). Resource schemas use passthrough deliberately so Vikunja fields survive; the audit/plan schemas are fully typed."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "boardAudit and reorderPlan are infinite lifetime with garbageCollection 30, one instance per project per run, so the datastore keeps a bounded history of audits."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "This model deliberately does not update or delete tasks: POST /tasks/{id} is a full replace that has blanked descriptions before, so judgement edits stay with the calling agent doing GET, merge, POST. Scope is create, list, audit, reorder."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "reorder resolves and validates every requested bucket title against the live view before the first write; new_task resolves the bucket before creating. Kanban view existence is checked first in all board methods."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "task-<id>, list-<id>, summary-recent, audit-<projectId>, reorder-<projectId>: deterministic and collision-free per project."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "All state is read from the Vikunja API on every run; nothing is read from the datastore or the filesystem."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.09.15.1 appended at the end of the upgrade chain (the runtime requires the chain to terminate at the current version); upgradeAttributes is identity because every new global argument has a default."
+    }
+  ]
+}
