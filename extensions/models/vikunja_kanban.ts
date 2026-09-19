@@ -361,6 +361,18 @@ const DueReportArgsSchema = z.object({
   ),
 });
 
+const SetDueDateArgsSchema = z.object({
+  taskId: z.number().int().positive().describe("Vikunja task id."),
+  dueDate: z.string().describe(
+    "ISO 8601 instant to set as the due date (the day to look at the card " +
+      "again), e.g. 2026-11-04T17:00:00Z. An empty string clears it.",
+  ),
+  projectId: ProjectIdOverride.describe(
+    "Project whose kanban view is read to assert the card's bucket did not " +
+      "change. Defaults to the configured projectId.",
+  ),
+});
+
 const ReorderArgsSchema = z.object({
   projectId: ProjectIdOverride,
   apply: z.boolean().default(false).describe(
@@ -1343,6 +1355,100 @@ async function dueReport(
   return { dataHandles: [handle] };
 }
 
+/** Bucket title a task currently sits in on the project's kanban view. */
+async function bucketTitleOf(
+  g: GlobalArgs,
+  projectId: number,
+  viewId: number,
+  taskId: number,
+): Promise<string | null> {
+  const board = await fetchBoard(g, projectId, viewId);
+  for (const b of board) {
+    if (b.tasks.some((t) => t.id === taskId)) return b.title;
+  }
+  return null;
+}
+
+/**
+ * Set (or clear) a task's due date. POST /tasks/{id} is a FULL REPLACE in
+ * Vikunja, so this reads the whole task, changes one field, writes the whole
+ * task back, then reads it again and asserts both the date and the card's
+ * bucket are what they should be — HTTP 200 proves nothing on its own.
+ * Refuses done cards.
+ */
+async function setDueDate(
+  args: z.infer<typeof SetDueDateArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const wanted = args.dueDate.trim() === "" ? null : args.dueDate.trim();
+  if (wanted !== null && !Number.isFinite(Date.parse(wanted))) {
+    throw new Error(`dueDate is not a parseable instant: ${args.dueDate}`);
+  }
+
+  const viewId = await requireKanbanView(g, projectId);
+  const bucketBefore = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  if (bucketBefore === null) {
+    throw new Error(
+      `Task ${args.taskId} is not on project ${projectId}'s kanban view.`,
+    );
+  }
+
+  const full = await vreq(g, "GET", `/tasks/${args.taskId}`) as Record<
+    string,
+    unknown
+  >;
+  if (full.done === true) {
+    throw new Error(`Task ${args.taskId} is done; not touching a done card.`);
+  }
+  const before = dueDateOf(full.due_date);
+  if (
+    (before === null && wanted === null) ||
+    (before !== null && wanted !== null &&
+      Date.parse(before) === Date.parse(wanted))
+  ) {
+    ctx.logger?.info(`Task ${args.taskId}: due date already ${wanted}`);
+  } else {
+    await vreq(g, "POST", `/tasks/${args.taskId}`, {
+      body: { ...full, due_date: wanted },
+    });
+  }
+
+  const after = await vreq(g, "GET", `/tasks/${args.taskId}`) as Record<
+    string,
+    unknown
+  >;
+  const got = dueDateOf(after.due_date);
+  const matches = wanted === null
+    ? got === null
+    : got !== null && Date.parse(got) === Date.parse(wanted);
+  if (!matches) {
+    throw new Error(
+      `Task ${args.taskId}: due date read back as ${got}, wanted ${wanted}.`,
+    );
+  }
+  const bucketAfter = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  if (bucketAfter !== bucketBefore) {
+    throw new Error(
+      `Task ${args.taskId}: due date is set but the card moved from bucket ` +
+        `"${bucketBefore}" to "${bucketAfter}" — a full-replace write ` +
+        `un-bucketed it; move it back by hand.`,
+    );
+  }
+
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `task-${args.taskId}`,
+    toVikunjaTask(after, fetchedAt),
+  );
+  ctx.logger?.info(`Task ${args.taskId}: due date ${before} -> ${got}`, {
+    bucket: bucketAfter,
+  });
+  return { dataHandles: [handle] };
+}
+
 async function reorder(
   args: ReorderArgs,
   ctx: ExecCtx,
@@ -1461,7 +1567,7 @@ async function reorder(
 /** Vikunja kanban orchestrator: create and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.19.1",
+  version: "2026.09.19.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1513,6 +1619,16 @@ export const model = {
         "optional webBaseUrl global arg for task links when the API is " +
         "called on a different address than the web UI. Existing model " +
         "attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.19.2",
+      description:
+        "Added set_due_date: set or clear one card's due date via a " +
+        "read-modify-write of the full task (POST /tasks/{id} is a full " +
+        "replace), refusing done cards and asserting on read-back that " +
+        "the date took and the card's bucket did not change. Existing " +
+        "model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1586,6 +1702,16 @@ export const model = {
         "workflow gated on counts.actionable > 0 turns that into a nudge.",
       arguments: DueReportArgsSchema,
       execute: dueReport,
+    },
+    set_due_date: {
+      description:
+        "Set or clear one card's due date — the day to look at it again. " +
+        "Reads the full task, writes it back with only due_date changed " +
+        "(Vikunja's POST /tasks/{id} is a full replace), re-reads and " +
+        "asserts the date took and the card is still in the same bucket. " +
+        "Refuses done cards. Records the task as a vikunjaTask resource.",
+      arguments: SetDueDateArgsSchema,
+      execute: setDueDate,
     },
     new_task: {
       description:

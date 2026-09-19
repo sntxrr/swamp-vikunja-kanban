@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.09.19.2",
+  "reviewedAt": "2026-09-19T22:17:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "apiToken is meta({sensitive:true}) and documented as vault-only. vreq never includes the token in thrown errors or logs; error bodies are sliced to 300 chars of the server response. No other secret-shaped fields. 2026.09.19.1 adds webBaseUrl (a URL, not a secret) and no new credential paths; due_report reuses vreq. The credentials-sensitive-field heuristic still fires on id/title/description-shaped fields \u2014 examined, all identifiers, not secrets. set_due_date adds no credential surface."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Structured info/warning logs with ids, counts and bucket names; per-move log in reorder apply; no descriptions or tokens logged. due_report logs counts and asOf only \u2014 never card titles or the rendered message. set_due_date logs id, before/after date and bucket only."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Non-2xx throws with method+path+status. reorder throws on unknown bucket names before any write, on maxIterations, and when the final re-read is still out of order. audit throws on a project with no kanban view or no buckets rather than reporting an empty board as clean. due_report throws on an unparseable `now`, on a project with no kanban view, and on zero buckets \u2014 an empty board is never reported as 'nothing due'. Unparseable due dates on individual cards are skipped, not fatal. set_due_date throws on an unparseable dueDate, a card not on the view, a done card, a read-back that does not match, and a bucket that changed after the write (the un-bucket failure mode of a full-replace POST) \u2014 never a silent 200."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "15 deno tests. Added: dueDateOf rejects Vikunja's zero time (0001-01-01), empty, undefined and junk; classifyDue splits by whole UTC day (a card due 09:00 is still 'today' at 12:00), sorts most-overdue first, skips done cards, null dates and the done bucket, and honours lookaheadDays including 0; renderDueMessage emits only non-empty sections, the 'Nothing due.' fallback, and the '(Nd overdue, bucket)' suffix. HTTP path exercised live against the 50-card board (2 dated cards, both landed in the expected list). 12 deno tests cover the pure rules: role mapping, HTML text length, every audit rule and its role-scoped severity, label groups, staleness thresholds, done-flag mismatch, sort order both tie-breaks, bucket WIP/order findings, nextMove midpoint and collapsed-gap fallback. set_due_date is an HTTP round-trip with no pure core; exercised live on card #62 from the consumer repo immediately after publish (2026-11-11 -> 2026-11-04, bucket unchanged, read-back asserted) and the outcome recorded in the PR."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "audit is read-only. reorder converges to a fixed point: a re-run after apply plans zero moves. 429 retried with Retry-After up to maxRetries; per-request AbortController timeout. due_report is read-only and deterministic for a given `now`. set_due_date is idempotent: an already-matching date skips the write and still asserts on read-back."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Never uses POST /tasks/{id} (a full replace in Vikunja). Positions set via POST /tasks/{id}/position with project_view_id. Board read via /projects/{p}/views/{v}/tasks paginated per bucket with page size from /info and a no-growth stop, because one page silently truncates long buckets. Bucket tasks may be null; handled. due_report reads due_date from the same board endpoint; Vikunja reports an unset due date as Go's zero time, which is parsed as year 1 and would otherwise read as 2000 years overdue \u2014 dueDateOf maps anything before the epoch to null. set_due_date honours the full-replace contract: GET the whole task, change one field, POST the whole task, GET again."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "fetch bodies cancelled on retry; timers cleared in finally; page loop bounded at 100 pages; reorder bounded by maxIterations (max 500)."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Archive is the model file, README and LICENSE only; the test file is not packaged. README uses vikunja.example.com; no internal hostnames, ids or vault names in packaged files. webBaseUrl default is baseUrl; the README example stays on vikunja.example.com."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Method args are strict zod objects with defaults and bounds (apply defaults false; maxIterations 1..500). Resource schemas use passthrough deliberately so Vikunja fields survive; the audit/plan schemas are fully typed. due_report args: lookaheadDays int 0..365 default 7, now optional ISO string. dueReport resource fully typed (daysUntil int) with passthrough for forward-compat."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "boardAudit and reorderPlan are infinite lifetime with garbageCollection 30, one instance per project per run, so the datastore keeps a bounded history of audits. dueReport: infinite lifetime, GC 30, one instance per project (due-<projectId>) so a daily run keeps a month."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "This model deliberately does not update or delete tasks: POST /tasks/{id} is a full replace that has blanked descriptions before, so judgement edits stay with the calling agent doing GET, merge, POST. Scope is create, list, audit, reorder. set_due_date is the first field-level update; it is deliberately single-field so the blast radius of a full-replace write stays one attribute."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "reorder resolves and validates every requested bucket title against the live view before the first write; new_task resolves the bucket before creating. Kanban view existence is checked first in all board methods."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "task-<id>, list-<id>, summary-recent, audit-<projectId>, reorder-<projectId>: deterministic and collision-free per project. dueReport instance is due-<projectId>, parallel to audit-<projectId>."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "All state is read from the Vikunja API on every run; nothing is read from the datastore or the filesystem."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.09.15.1 appended at the end of the upgrade chain (the runtime requires the chain to terminate at the current version); upgradeAttributes is identity because every new global argument has a default. 2026.09.19.1 upgrade entry added; additive only, attributes carry over unchanged."
+    }
+  ]
+}

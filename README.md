@@ -119,6 +119,17 @@ swamp model method run homelab-backlog due_report --arg now=2026-09-26T15:30:00Z
 
 Cards in the done bucket, cards with `done: true`, and cards whose due date is Vikunja's zero time (`0001-01-01…`, which is how it reports "unset") are ignored. Links use `webBaseUrl` when set, else `baseUrl` — set it when the API is called on an internal address but links should open the public one.
 
+### `set_due_date`
+
+Sets (or clears, with an empty string) one card's due date — the day to look at it again.
+
+```sh
+swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDate=2026-11-04T17:00:00Z
+swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDate=""     # clear
+```
+
+`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took **and** that the card is still in the same kanban bucket. Done cards are refused. The result is recorded as a `vikunjaTask` resource.
+
 ### Board shape and thresholds
 
 Two global arguments describe the board; every field has a default, so set only what differs.
