@@ -2,9 +2,13 @@ import { assertEquals, assertStrictEquals } from "jsr:@std/assert@1";
 import {
   auditBucket,
   auditCard,
+  type BoardBucket,
   type BoardTask,
+  classifyDue,
+  dueDateOf,
   intendedOrder,
   nextMove,
+  renderDueMessage,
   roleOf,
   textLength,
 } from "./vikunja_kanban.ts";
@@ -41,6 +45,7 @@ function task(over: Partial<BoardTask> & { id: number }): BoardTask {
     created: "2026-09-01T00:00:00Z",
     updated: "2026-09-15T00:00:00Z",
     labels: [],
+    dueDate: null,
     ...over,
   };
 }
@@ -195,4 +200,79 @@ Deno.test("nextMove nudges past a collapsed gap instead of dividing by nothing",
   const m = nextMove(current, intendedOrder(current, "oldest"))!;
   assertEquals(m.task.id, 2);
   assertEquals(m.position, 1);
+});
+
+// ----------------------------------------------------------------------------
+// due_report
+// ----------------------------------------------------------------------------
+
+function bucket(title: string, tasks: BoardTask[]): BoardBucket {
+  return { id: title.length, title, position: 0, tasks };
+}
+
+Deno.test("dueDateOf treats Vikunja's zero time and junk as unset", () => {
+  assertStrictEquals(dueDateOf("0001-01-01T00:00:00Z"), null);
+  assertStrictEquals(dueDateOf(""), null);
+  assertStrictEquals(dueDateOf(undefined), null);
+  assertStrictEquals(dueDateOf("not a date"), null);
+  assertStrictEquals(dueDateOf("2026-09-26T00:00:00Z"), "2026-09-26T00:00:00Z");
+});
+
+Deno.test("classifyDue splits by whole UTC day and honours the lookahead", () => {
+  // now is 2026-09-15T12:00Z; a card due earlier that same day is still today.
+  const board = [
+    bucket("Backlog", [
+      task({ id: 1, dueDate: "2026-09-13T23:59:00Z" }), // 2 days overdue
+      task({ id: 2, dueDate: "2026-09-15T09:00:00Z" }), // today, already past
+      task({ id: 3, dueDate: "2026-09-22T00:00:00Z" }), // +7, last day inside
+      task({ id: 4, dueDate: "2026-09-23T00:00:00Z" }), // +8, outside
+      task({ id: 5, dueDate: null }),
+      task({ id: 6, dueDate: "2026-09-15T20:00:00Z", done: true }),
+    ]),
+    bucket("Blocked", [task({ id: 7, dueDate: "2026-09-14T00:00:00Z" })]),
+    bucket("Done", [task({ id: 8, dueDate: "2026-09-01T00:00:00Z" })]),
+  ];
+  const r = classifyDue(board, roles, now, 7, "https://v.example");
+  assertEquals(r.overdue.map((i) => [i.id, i.daysUntil]), [[1, -2], [7, -1]]);
+  assertEquals(r.dueToday.map((i) => i.id), [2]);
+  assertEquals(r.upcoming.map((i) => [i.id, i.daysUntil]), [[3, 7]]);
+  assertEquals(r.overdue[1].bucket, "Blocked");
+  assertEquals(r.dueToday[0].url, "https://v.example/tasks/2");
+  // lookahead 0: only overdue and today remain.
+  assertEquals(classifyDue(board, roles, now, 0, "x").upcoming, []);
+});
+
+Deno.test("renderDueMessage lists only non-empty sections", () => {
+  const item = {
+    id: 42,
+    title: "Drop the snapshot",
+    bucket: "Blocked",
+    dueDate: "2026-09-26T00:00:00Z",
+    daysUntil: 0,
+    url: "https://v.example/tasks/42",
+  };
+  const msg = renderDueMessage(
+    { overdue: [], dueToday: [item], upcoming: [] },
+    7,
+    "https://v.example/projects/5",
+  );
+  assertEquals(
+    msg,
+    "**Due today (1)**\n" +
+      "- [#42](https://v.example/tasks/42) Drop the snapshot — 2026-09-26 " +
+      "(today, Blocked)\n\n" +
+      "Board: https://v.example/projects/5",
+  );
+  const empty = renderDueMessage(
+    { overdue: [], dueToday: [], upcoming: [] },
+    7,
+    "https://v.example/projects/5",
+  );
+  assertEquals(empty, "Nothing due.\n\nBoard: https://v.example/projects/5");
+  const over = renderDueMessage(
+    { overdue: [{ ...item, daysUntil: -3 }], dueToday: [], upcoming: [] },
+    7,
+    "b",
+  );
+  assertEquals(over.split("\n")[1].includes("(3d overdue, Blocked)"), true);
 });
