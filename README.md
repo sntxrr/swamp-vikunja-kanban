@@ -107,6 +107,18 @@ swamp model method run homelab-backlog reorder --arg apply=true --arg 'buckets=[
 
 With `apply=true` it moves **one card at a time** — read the bucket, move the first card that is out of place to the midpoint of its intended neighbours (`POST /tasks/{id}/position`), re-read, repeat — and fails if the board has not converged within `maxIterations`. It works this way because Vikunja re-derives positions on write, so a batch of absolute positions drifts (measured: 2 of 39 cards landed in the wrong slot with HTTP 200 on every call). A run that converges ends with a re-read that matches the intended order; a second dry run then reports 0 moves.
 
+### `due_report`
+
+Read-only. Treats a card's **due date as the day to look at it again**: reads the board and splits every dated, not-done card into *overdue*, *due today* and *upcoming* (due within `lookaheadDays`, default 7), by whole UTC calendar day. Writes a `dueReport` resource whose `message` is a ready-to-send Markdown list with a link per card, and `counts.actionable` (overdue + due today) is what a scheduled nudge should gate on.
+
+```sh
+swamp model method run homelab-backlog due_report
+swamp model method run homelab-backlog due_report --arg lookaheadDays=14
+swamp model method run homelab-backlog due_report --arg now=2026-09-26T15:30:00Z   # what would fire on that day
+```
+
+Cards in the done bucket, cards with `done: true`, and cards whose due date is Vikunja's zero time (`0001-01-01…`, which is how it reports "unset") are ignored. Links use `webBaseUrl` when set, else `baseUrl` — set it when the API is called on an internal address but links should open the public one.
+
 ### Board shape and thresholds
 
 Two global arguments describe the board; every field has a default, so set only what differs.
@@ -131,6 +143,7 @@ globalArguments:
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
 - `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
 - `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `converged`.
+- `dueReport` — one due-date pass: `overdue`, `dueToday`, `upcoming` (each `id`, `title`, `bucket`, `dueDate`, `daysUntil`, `url`), `counts` (incl. `actionable`), the Markdown `message`, and `boardUrl`.
 
 ## Notes
 

@@ -34,6 +34,12 @@ const GlobalArgsSchema = z.object({
     "Base URL of the Vikunja instance, e.g. https://vikunja.example.com " +
       "(no trailing slash, no /api/v1 suffix \u2014 that's added automatically).",
   ),
+  webBaseUrl: z.string().optional().describe(
+    "Base URL the web UI is reached at, used only to build task links in " +
+      "due_report (e.g. https://vikunja.example.com). Defaults to baseUrl; " +
+      "set it when the API is called on an internal address but links " +
+      "should open the public one.",
+  ),
   apiToken: z.string().min(1).meta({ sensitive: true }).describe(
     "Vikunja personal API token (Bearer). Supply via a swamp vault " +
       "reference in the model definition's globalArguments — see README " +
@@ -257,6 +263,46 @@ const ReorderPlanSchema = z.object({
   })),
 }).passthrough();
 
+const DueItemSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  bucket: z.string(),
+  dueDate: z.string().describe("ISO 8601 due date as Vikunja stores it."),
+  daysUntil: z.number().int().describe(
+    "Whole UTC days from the report's `asOf` date to the due date: " +
+      "negative = overdue, 0 = due today.",
+  ),
+  url: z.string().describe("Task link, built from webBaseUrl (or baseUrl)."),
+});
+/** One dated card as due_report reports it. */
+export type DueItem = z.infer<typeof DueItemSchema>;
+
+const DueReportSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  asOf: z.string().describe("ISO 8601 instant the board was read at."),
+  lookaheadDays: z.number().int(),
+  counts: z.object({
+    overdue: z.number(),
+    dueToday: z.number(),
+    upcoming: z.number(),
+    actionable: z.number().describe(
+      "overdue + dueToday — what the nudge fires on.",
+    ),
+  }),
+  overdue: z.array(DueItemSchema),
+  dueToday: z.array(DueItemSchema),
+  upcoming: z.array(DueItemSchema).describe(
+    "Due after today and within lookaheadDays, soonest first.",
+  ),
+  message: z.string().describe(
+    "Ready-to-send Markdown body listing every section that is non-empty.",
+  ),
+  boardUrl: z.string(),
+}).passthrough();
+/** The `dueReport` resource written by due_report. */
+export type DueReport = z.infer<typeof DueReportSchema>;
+
 // ============================================================================
 // Method argument schemas
 // ============================================================================
@@ -301,6 +347,18 @@ type NewTaskArgs = z.infer<typeof NewTaskArgsSchema>;
 
 const AuditArgsSchema = z.object({
   projectId: ProjectIdOverride,
+});
+
+const DueReportArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+  lookaheadDays: z.number().int().min(0).max(365).default(7).describe(
+    "Cards due within this many days after today are listed as upcoming. " +
+      "0 lists only overdue and due-today cards.",
+  ),
+  now: z.string().optional().describe(
+    "ISO 8601 instant to evaluate against instead of the clock (for tests " +
+      "and dry runs).",
+  ),
 });
 
 const ReorderArgsSchema = z.object({
@@ -746,8 +804,11 @@ export interface BoardTask {
   created: string;
   updated: string;
   labels: string[];
+  /** ISO 8601 due date, or null when unset (Vikunja's zero time `0001-01-01…`). */
+  dueDate: string | null;
 }
 
+/** One kanban column with its tasks in view order. */
 export interface BoardBucket {
   id: number;
   title: string;
@@ -788,7 +849,20 @@ function toBoardTask(raw: Record<string, unknown>): BoardTask | null {
     labels: asArray(raw.labels).map((l) => l.title).filter((t): t is string =>
       typeof t === "string"
     ),
+    dueDate: dueDateOf(raw.due_date),
   };
+}
+
+/**
+ * Vikunja has no "unset" for a timestamp: it returns Go's zero time,
+ * `0001-01-01T00:00:00Z`, which is a perfectly parseable date 2000 years
+ * overdue. Anything before year 1970 is treated as unset.
+ */
+export function dueDateOf(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t) || t < 0) return null;
+  return raw;
 }
 
 /**
@@ -1123,6 +1197,152 @@ async function audit(
   return { dataHandles: [handle] };
 }
 
+// ============================================================================
+// Due-date report
+// ============================================================================
+
+/** UTC calendar day of an instant, as days since the epoch. */
+function utcDay(ms: number): number {
+  return Math.floor(ms / 86_400_000);
+}
+
+/**
+ * Split the board's dated, not-done cards into overdue / due today /
+ * upcoming (within lookaheadDays), by whole UTC calendar days so that a card
+ * due at 09:00 is "today" all day rather than flipping to overdue at 09:01.
+ * Each list is soonest-first; overdue is most-overdue-first.
+ */
+export function classifyDue(
+  board: BoardBucket[],
+  roles: Roles,
+  now: Date,
+  lookaheadDays: number,
+  webBase: string,
+): { overdue: DueItem[]; dueToday: DueItem[]; upcoming: DueItem[] } {
+  const today = utcDay(now.getTime());
+  const overdue: DueItem[] = [];
+  const dueToday: DueItem[] = [];
+  const upcoming: DueItem[] = [];
+  for (const b of board) {
+    if (roleOf(b.title, roles) === "done") continue;
+    for (const t of b.tasks) {
+      if (t.done || t.dueDate === null) continue;
+      const due = Date.parse(t.dueDate);
+      if (!Number.isFinite(due)) continue;
+      const daysUntil = utcDay(due) - today;
+      const item: DueItem = {
+        id: t.id,
+        title: t.title,
+        bucket: b.title,
+        dueDate: t.dueDate,
+        daysUntil,
+        url: `${webBase}/tasks/${t.id}`,
+      };
+      if (daysUntil < 0) overdue.push(item);
+      else if (daysUntil === 0) dueToday.push(item);
+      else if (daysUntil <= lookaheadDays) upcoming.push(item);
+    }
+  }
+  const soonest = (a: DueItem, b: DueItem) =>
+    a.daysUntil - b.daysUntil || a.id - b.id;
+  overdue.sort(soonest);
+  dueToday.sort(soonest);
+  upcoming.sort(soonest);
+  return { overdue, dueToday, upcoming };
+}
+
+function dueLine(i: DueItem): string {
+  const when = i.daysUntil < 0
+    ? `${-i.daysUntil}d overdue`
+    : i.daysUntil === 0
+    ? "today"
+    : `in ${i.daysUntil}d`;
+  return `- [#${i.id}](${i.url}) ${i.title} — ${i.dueDate.slice(0, 10)} ` +
+    `(${when}, ${i.bucket})`;
+}
+
+/** Markdown body: one section per non-empty list, nothing for empty ones. */
+export function renderDueMessage(
+  r: { overdue: DueItem[]; dueToday: DueItem[]; upcoming: DueItem[] },
+  lookaheadDays: number,
+  boardUrl: string,
+): string {
+  const parts: string[] = [];
+  if (r.overdue.length > 0) {
+    parts.push(
+      `**Overdue (${r.overdue.length})**\n` +
+        r.overdue.map(dueLine).join("\n"),
+    );
+  }
+  if (r.dueToday.length > 0) {
+    parts.push(
+      `**Due today (${r.dueToday.length})**\n` +
+        r.dueToday.map(dueLine).join("\n"),
+    );
+  }
+  if (r.upcoming.length > 0) {
+    parts.push(
+      `**Next ${lookaheadDays} days (${r.upcoming.length})**\n` +
+        r.upcoming.map(dueLine).join("\n"),
+    );
+  }
+  if (parts.length === 0) parts.push("Nothing due.");
+  parts.push(`Board: ${boardUrl}`);
+  return parts.join("\n\n");
+}
+
+async function dueReport(
+  args: z.infer<typeof DueReportArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const now = args.now ? new Date(args.now) : new Date();
+  if (!Number.isFinite(now.getTime())) {
+    throw new Error(`now is not a parseable instant: ${args.now}`);
+  }
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  const webBase = (g.webBaseUrl ?? g.baseUrl).replace(/\/+$/, "");
+  const boardUrl = `${webBase}/projects/${projectId}`;
+  const lists = classifyDue(
+    board,
+    g.bucketRoles,
+    now,
+    args.lookaheadDays,
+    webBase,
+  );
+  const report = DueReportSchema.parse({
+    projectId,
+    viewId,
+    asOf: now.toISOString(),
+    lookaheadDays: args.lookaheadDays,
+    counts: {
+      overdue: lists.overdue.length,
+      dueToday: lists.dueToday.length,
+      upcoming: lists.upcoming.length,
+      actionable: lists.overdue.length + lists.dueToday.length,
+    },
+    ...lists,
+    message: renderDueMessage(lists, args.lookaheadDays, boardUrl),
+    boardUrl,
+  });
+  const handle = await ctx.writeResource(
+    "dueReport",
+    `due-${projectId}`,
+    report,
+  );
+  ctx.logger?.info(
+    `Due report for project ${projectId}: ${report.counts.overdue} overdue, ` +
+      `${report.counts.dueToday} due today, ${report.counts.upcoming} upcoming`,
+    { asOf: report.asOf, lookaheadDays: args.lookaheadDays },
+  );
+  return { dataHandles: [handle] };
+}
+
 async function reorder(
   args: ReorderArgs,
   ctx: ExecCtx,
@@ -1241,7 +1461,7 @@ async function reorder(
 /** Vikunja kanban orchestrator: create and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.15.1",
+  version: "2026.09.19.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1283,6 +1503,18 @@ export const model = {
         "attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.09.19.1",
+      description:
+        "Added due_report: reads the board and writes a dueReport resource " +
+        "splitting dated, not-done cards into overdue / due today / upcoming " +
+        "(lookaheadDays, default 7) with a ready-to-send Markdown message, " +
+        "so a scheduled workflow can nudge on a card's due date. Added " +
+        "optional webBaseUrl global arg for task links when the API is " +
+        "called on a different address than the web UI. Existing model " +
+        "attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     vikunjaTask: {
@@ -1314,6 +1546,14 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
+    dueReport: {
+      description:
+        "One due-date pass over a board: overdue, due-today and upcoming " +
+        "cards with counts and a Markdown message ready to send.",
+      schema: DueReportSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
   },
   methods: {
     audit: {
@@ -1336,6 +1576,16 @@ export const model = {
         "the board does not converge.",
       arguments: ReorderArgsSchema,
       execute: reorder,
+    },
+    due_report: {
+      description:
+        "Read-only: list the not-done cards on a project's board that are " +
+        "overdue, due today, or due within lookaheadDays, each with a link, " +
+        "and write a dueReport resource whose `message` is ready to send. " +
+        "Treat a card's due date as the day to look at it again; a daily " +
+        "workflow gated on counts.actionable > 0 turns that into a nudge.",
+      arguments: DueReportArgsSchema,
+      execute: dueReport,
     },
     new_task: {
       description:

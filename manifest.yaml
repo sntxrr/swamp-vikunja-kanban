@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.09.15.1"
+version: "2026.09.19.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -28,6 +28,10 @@ description: |
   - **reorder** — Sort every non-done bucket by priority then age. Dry run
     by default; apply moves one card at a time and re-reads until the
     board converges.
+  - **due_report** — Read-only: split the board's dated, not-done cards into
+    overdue / due today / upcoming (lookaheadDays) with a link per card and
+    a ready-to-send Markdown message, so a scheduled workflow can nudge on
+    a card's due date.
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
 paths:
   base: manifest
