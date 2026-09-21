@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.09.19.2"
+version: "2026.09.21.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -24,7 +24,8 @@ description: |
   - **audit** — Read-only Definition-of-Ready audit of the whole board:
     empty/short descriptions, missing labels or label groups, unset
     priority, missing verdict/acceptance/source-link markers, stale cards
-    per bucket role, WIP over the limit, buckets out of order.
+    per bucket role (waiting cards: by due date, which they must carry),
+    WIP over the limit, buckets out of order.
   - **reorder** — Sort every non-done bucket by priority then age. Dry run
     by default; apply moves one card at a time and re-reads until the
     board converges.

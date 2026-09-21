@@ -68,13 +68,16 @@ const GlobalArgsSchema = z.object({
     ready: z.string().default("Next"),
     doing: z.string().default("Doing"),
     blocked: z.string().default("Blocked"),
+    waiting: z.string().default("Waiting"),
     review: z.string().default("Review"),
     done: z.string().default("Done"),
   }).prefault({}).describe(
     "Which bucket title (case-insensitive) plays which role on the board. " +
       "audit and reorder scope their rules by role: the ready column must " +
       "pass the full Definition of Ready, doing/review/blocked have " +
-      "staleness thresholds, done is never reordered.",
+      "staleness thresholds, waiting cards must carry a due date and are " +
+      "stale once it has passed (and sort by due date, soonest first), " +
+      "done is never reordered.",
   ),
   policy: z.object({
     wipLimit: z.number().int().min(1).default(3).describe(
@@ -937,8 +940,16 @@ async function fetchBoard(
 export function intendedOrder(
   tasks: BoardTask[],
   tieBreak: Policy["tieBreak"],
+  role: Role = "other",
 ): BoardTask[] {
   return [...tasks].sort((a, b) => {
+    if (role === "waiting") {
+      // A waiting column is a calendar: soonest due date on top, undated
+      // (which audit reports as an error) at the bottom.
+      const da = a.dueDate === null ? Infinity : Date.parse(a.dueDate);
+      const db = b.dueDate === null ? Infinity : Date.parse(b.dueDate);
+      if (da !== db) return da - db;
+    }
     if (a.priority !== b.priority) return b.priority - a.priority;
     const cmp = a.created.localeCompare(b.created);
     return tieBreak === "oldest" ? cmp : -cmp;
@@ -992,6 +1003,28 @@ export function auditCard(
 
   const executable = role === "ready" || role === "doing" || role === "review";
   const must: Finding["severity"] = executable ? "error" : "warn";
+
+  // A waiting card is parked until a date, so the date IS the reason it is
+  // there: none is an error, and one that has passed means the wait is over
+  // and nobody acted — stale by definition, however recently it was edited.
+  if (role === "waiting") {
+    if (task.dueDate === null) {
+      add(
+        "missing-due-date",
+        "error",
+        "waiting with no due date — set the day to look at it again",
+      );
+    } else {
+      const overBy = utcDay(now.getTime()) - utcDay(Date.parse(task.dueDate));
+      if (overBy > 0) {
+        add(
+          "stale",
+          "warn",
+          `due date passed ${overBy} d ago — act on it or re-date it`,
+        );
+      }
+    }
+  }
 
   const len = textLength(task.description);
   if (len === 0) add("empty-description", "error", "description is empty");
@@ -1080,7 +1113,10 @@ export function auditBucket(
 ): { findings: Finding[]; inOrder: boolean } {
   const findings: Finding[] = [];
   const inOrder = role === "done" ||
-    sameOrder(bucket.tasks, intendedOrder(bucket.tasks, policy.tieBreak));
+    sameOrder(
+      bucket.tasks,
+      intendedOrder(bucket.tasks, policy.tieBreak, role),
+    );
   if (!inOrder) {
     findings.push({
       taskId: null,
@@ -1463,6 +1499,8 @@ async function reorder(
     wanted
       ? wanted.includes(title.toLowerCase())
       : roleOf(title, g.bucketRoles) !== "done";
+  const orderOf = (b: BoardBucket) =>
+    intendedOrder(b.tasks, g.policy.tieBreak, roleOf(b.title, g.bucketRoles));
 
   let board = await fetchBoard(g, projectId, viewId);
   if (board.length === 0) {
@@ -1480,7 +1518,7 @@ async function reorder(
   const moves: z.infer<typeof ReorderPlanSchema>["moves"] = [];
   for (const b of board) {
     if (!inScope(b.title)) continue;
-    const intended = intendedOrder(b.tasks, g.policy.tieBreak);
+    const intended = orderOf(b);
     b.tasks.forEach((t, from) => {
       const to = intended.findIndex((x) => x.id === t.id);
       if (to !== from) {
@@ -1502,10 +1540,7 @@ async function reorder(
         if (!b) {
           throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
         }
-        const move = nextMove(
-          b.tasks,
-          intendedOrder(b.tasks, g.policy.tieBreak),
-        );
+        const move = nextMove(b.tasks, orderOf(b));
         if (!move) break;
         if (iterations >= args.maxIterations) {
           throw new Error(
@@ -1529,7 +1564,7 @@ async function reorder(
       }
     }
     converged = board.filter((b) => inScope(b.title)).every((b) =>
-      sameOrder(b.tasks, intendedOrder(b.tasks, g.policy.tieBreak))
+      sameOrder(b.tasks, orderOf(b))
     );
     if (!converged) {
       throw new Error(

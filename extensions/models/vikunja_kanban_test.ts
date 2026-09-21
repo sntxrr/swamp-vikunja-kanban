@@ -18,6 +18,7 @@ const roles = {
   ready: "Next",
   doing: "Doing",
   blocked: "Blocked",
+  waiting: "Waiting",
   review: "Review",
   done: "Done",
 };
@@ -61,6 +62,7 @@ const readyCard = task({
 });
 
 Deno.test("roleOf is case-insensitive and falls back to other", () => {
+  assertStrictEquals(roleOf("waiting", roles), "waiting");
   assertStrictEquals(roleOf("next", roles), "ready");
   assertStrictEquals(roleOf("DONE", roles), "done");
   assertStrictEquals(roleOf("Icebox", roles), "other");
@@ -129,6 +131,74 @@ Deno.test("staleness uses the per-role threshold", () => {
     ["stale"],
   );
   assertEquals(auditCard(old, "Backlog", "backlog", policy, now), []);
+});
+
+Deno.test("waiting: the due date is the rule, not the edit age", () => {
+  // Untouched for two weeks but due in three weeks: nothing to report.
+  const parked = { ...readyCard, updated: "2026-09-01T00:00:00Z" };
+  assertEquals(
+    auditCard(
+      { ...parked, dueDate: "2026-10-10T17:00:00Z" },
+      "Waiting",
+      "waiting",
+      policy,
+      now,
+    ),
+    [],
+  );
+  // No due date at all is an error even on an otherwise perfect card.
+  const undated = auditCard(parked, "Waiting", "waiting", policy, now);
+  assertEquals(undated.map((f) => [f.rule, f.severity]), [[
+    "missing-due-date",
+    "error",
+  ]]);
+  // Due yesterday (any hour) → stale by one day; edited today changes nothing.
+  const passed = auditCard(
+    {
+      ...readyCard,
+      updated: now.toISOString(),
+      dueDate: "2026-09-14T23:59:00Z",
+    },
+    "Waiting",
+    "waiting",
+    policy,
+    now,
+  );
+  assertEquals(passed.map((f) => f.rule), ["stale"]);
+  assertEquals(passed[0].detail.startsWith("due date passed 1 d ago"), true);
+  // Due later today is not passed.
+  assertEquals(
+    auditCard(
+      { ...readyCard, dueDate: "2026-09-15T01:00:00Z" },
+      "Waiting",
+      "waiting",
+      policy,
+      now,
+    ),
+    [],
+  );
+});
+
+Deno.test("intendedOrder: waiting sorts by due date, undated last", () => {
+  const ts = [
+    task({ id: 1, priority: 5, dueDate: "2026-11-04T17:00:00Z" }),
+    task({ id: 2, priority: 0 }),
+    task({ id: 3, priority: 1, dueDate: "2026-09-26T17:00:00Z" }),
+    task({ id: 4, priority: 3, dueDate: "2026-09-26T17:00:00Z" }),
+  ];
+  assertEquals(intendedOrder(ts, "oldest", "waiting").map((t) => t.id), [
+    4,
+    3,
+    1,
+    2,
+  ]);
+  // Every other role ignores the due date entirely.
+  assertEquals(intendedOrder(ts, "oldest", "ready").map((t) => t.id), [
+    1,
+    4,
+    3,
+    2,
+  ]);
 });
 
 Deno.test("done flag must match the done bucket", () => {
