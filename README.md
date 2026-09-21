@@ -91,14 +91,14 @@ Rules, scoped by the **role** of the bucket the card sits in (`bucketRoles`, bel
 | `stale` | `updated` older than `policy.staleDays.<role>` (ready 14 d, doing 7 d, blocked 1 d, review 3 d); in the **waiting** column, the due date has passed (however recently the card was edited) | warn | — |
 | `missing-due-date` | a card in the **waiting** column has no due date — the date is the only reason it is parked there | — | error (waiting) |
 | `done-flag-mismatch` | `done` disagrees with the bucket | warn | warn |
-| `out-of-order` (bucket) | not sorted by priority desc then age (waiting: by due date, soonest first) — run `reorder` | warn | warn |
+| `out-of-order` (bucket) | not sorted by priority desc then age (waiting: by due day, then priority) — run `reorder` | warn | warn |
 | `wip-exceeded` (bucket) | doing bucket holds more than `policy.wipLimit` (default 3) | warn | — |
 
 The `ready` roll-up counts how many cards in the ready column have **zero error-level findings** — the number an executor agent can safely pull from.
 
 ### `reorder`
 
-Sorts each non-done bucket by **priority descending** (5 = DO NOW first, 0 = unset last), then by age (`policy.tieBreak`, default oldest first). The **waiting** bucket is a calendar instead: soonest due date on top, undated cards last, priority only as a tie-break. **Dry run by default** — it reports every card that is out of place and moves nothing.
+Sorts each non-done bucket by **priority descending** (5 = DO NOW first, 0 = unset last), then by age (`policy.tieBreak`, default oldest first). The **waiting** bucket is a calendar instead: soonest due **day** (UTC) on top — cards due the same day fall back to priority — and undated cards last. **Dry run by default** — it reports every card that is out of place and moves nothing.
 
 ```sh
 swamp model method run homelab-backlog reorder                    # plan only

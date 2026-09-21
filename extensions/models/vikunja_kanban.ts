@@ -944,10 +944,12 @@ export function intendedOrder(
 ): BoardTask[] {
   return [...tasks].sort((a, b) => {
     if (role === "waiting") {
-      // A waiting column is a calendar: soonest due date on top, undated
-      // (which audit reports as an error) at the bottom.
-      const da = a.dueDate === null ? Infinity : Date.parse(a.dueDate);
-      const db = b.dueDate === null ? Infinity : Date.parse(b.dueDate);
+      // A waiting column is a calendar: soonest due *day* on top, undated
+      // (which audit reports as an error) at the bottom. The due date means
+      // "look at it again on this day", so two cards due the same UTC day
+      // are equal here whatever their time of day, and priority decides.
+      const da = a.dueDate === null ? Infinity : utcDay(Date.parse(a.dueDate));
+      const db = b.dueDate === null ? Infinity : utcDay(Date.parse(b.dueDate));
       if (da !== db) return da - db;
     }
     if (a.priority !== b.priority) return b.priority - a.priority;
@@ -1125,7 +1127,9 @@ export function auditBucket(
       role,
       rule: "out-of-order",
       severity: "warn",
-      detail: "not sorted by priority desc, then age — run reorder",
+      detail: role === "waiting"
+        ? "not sorted by due day, then priority — run reorder"
+        : "not sorted by priority desc, then age — run reorder",
     });
   }
   if (role === "doing" && bucket.tasks.length > policy.wipLimit) {

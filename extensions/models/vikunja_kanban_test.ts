@@ -179,11 +179,12 @@ Deno.test("waiting: the due date is the rule, not the edit age", () => {
   );
 });
 
-Deno.test("intendedOrder: waiting sorts by due date, undated last", () => {
+Deno.test("intendedOrder: waiting sorts by due day, undated last", () => {
   const ts = [
     task({ id: 1, priority: 5, dueDate: "2026-11-04T17:00:00Z" }),
     task({ id: 2, priority: 0 }),
-    task({ id: 3, priority: 1, dueDate: "2026-09-26T17:00:00Z" }),
+    // Same day, earlier hour, lower priority: the day ties, priority wins.
+    task({ id: 3, priority: 1, dueDate: "2026-09-26T15:00:00Z" }),
     task({ id: 4, priority: 3, dueDate: "2026-09-26T17:00:00Z" }),
   ];
   assertEquals(intendedOrder(ts, "oldest", "waiting").map((t) => t.id), [
