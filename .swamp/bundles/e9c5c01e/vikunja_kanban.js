@@ -2,9 +2,51 @@
 const { z } = globalThis.__swamp_zod;
 var GlobalArgsSchema = z.object({
   baseUrl: z.string().min(1).describe("Base URL of the Vikunja instance, e.g. https://vikunja.example.com (no trailing slash, no /api/v1 suffix \u2014 that's added automatically)."),
-  apiToken: z.string().min(1).describe("Vikunja personal API token (Bearer). Supply via a swamp vault reference in the model definition's globalArguments \u2014 see README for the exact vault-get syntax; never inline the raw token here."),
-  projectId: z.number().int().positive().describe("Vikunja project id tasks are created in and listed from (e.g. the homelab backlog project)."),
-  viewId: z.number().int().positive().optional().describe("Optional Vikunja view id (bucket view) within the project. When set, new_task also places the created task into this view's default bucket via PUT /projects/{projectId}/views/{viewId}/buckets, if the instance's Vikunja version supports it; failures to bucket-place are logged as warnings and never fail task creation."),
+  webBaseUrl: z.string().optional().describe("Base URL the web UI is reached at, used only to build task links in due_report (e.g. https://vikunja.example.com). Defaults to baseUrl; set it when the API is called on an internal address but links should open the public one."),
+  apiToken: z.string().min(1).meta({
+    sensitive: true
+  }).describe("Vikunja personal API token (Bearer). Supply via a swamp vault reference in the model definition's globalArguments \u2014 see README for the exact vault-get syntax; never inline the raw token here."),
+  projectId: z.number().int().positive().describe("Default Vikunja project id tasks are created in and listed from (e.g. the homelab backlog project). Override per call with the projectId method argument."),
+  viewId: z.number().int().positive().optional().describe("Optional explicit kanban view id for the default projectId. Normally leave unset: the kanban view is discovered automatically via GET /projects/{id}/views. Only consulted when a call targets the default project; per-call projectId overrides always auto-discover."),
+  defaultBucketName: z.string().default("Backlog").describe("Bucket title (case-insensitive) that new_task places tasks into by default, so automation-created tasks land in a backlog column instead of the view's default (typically a working/doing column). Override per call with the bucketName method argument. Set to an empty string to disable bucket placement entirely."),
+  bucketRoles: z.object({
+    backlog: z.string().default("Backlog"),
+    ready: z.string().default("Next"),
+    doing: z.string().default("Doing"),
+    blocked: z.string().default("Blocked"),
+    waiting: z.string().default("Waiting"),
+    review: z.string().default("Review"),
+    done: z.string().default("Done")
+  }).prefault({}).describe("Which bucket title (case-insensitive) plays which role on the board. audit and reorder scope their rules by role: the ready column must pass the full Definition of Ready, doing/review/blocked have staleness thresholds, waiting cards must carry a due date and are stale once it has passed (and sort by due date, soonest first), done is never reordered."),
+  policy: z.object({
+    wipLimit: z.number().int().min(1).default(3).describe("Maximum cards in the doing bucket before audit reports wip-exceeded."),
+    staleDays: z.object({
+      ready: z.number().default(14),
+      doing: z.number().default(7),
+      blocked: z.number().default(1),
+      review: z.number().default(3)
+    }).prefault({}).describe("Days since `updated` after which a card in that role is reported stale."),
+    minDescriptionChars: z.number().int().min(0).default(400).describe("Descriptions shorter than this (HTML stripped) are reported as stubs."),
+    verdictMarkers: z.array(z.string()).default([
+      "CONFIRMED",
+      "DISSOLVED",
+      "MISSTATED"
+    ]).describe("A ready card's description must contain one of these premise-check verdicts (case-sensitive substring match)."),
+    acceptanceMarkers: z.array(z.string()).default([
+      "Acceptance",
+      "Proof",
+      "Done when",
+      "Verify"
+    ]).describe("A ready card's description must contain one of these (case-insensitive) \u2014 the marker of an acceptance criterion with a command and expected output."),
+    requiredLinkPrefix: z.string().default("obsidian://").describe("Every non-done card should link back to its source note with a URL starting with this prefix. Empty string disables the check."),
+    requiredLabelPrefixes: z.array(z.string()).default([
+      "tier-"
+    ]).describe("Label-group prefixes every non-done card must carry one of (e.g. tier-A/B/C). Any label NOT matching a prefix counts as the area label."),
+    tieBreak: z.enum([
+      "oldest",
+      "newest"
+    ]).default("oldest").describe("Within equal priority, whether older or newer cards sort first.")
+  }).prefault({}).describe("Definition-of-Ready thresholds used by audit and the sort order used by reorder. Every field has a default; override only what differs."),
   timeoutMs: z.number().int().positive().default(15e3).describe("Per-request fetch timeout in milliseconds."),
   maxRetries: z.number().int().min(0).max(10).default(5).describe("How many times to retry a request after an HTTP 429 rate-limit response."),
   userAgent: z.string().default("swamp-vikunja-kanban/1.0 (+https://swamp-club.com)").describe("User-Agent header sent on all outbound requests.")
@@ -23,6 +65,12 @@ var VikunjaTaskSchema = z.object({
   labels: z.array(LabelRefSchema).nullable().optional().describe("Labels currently attached to the task."),
   due_date: z.string().nullable().optional().describe("ISO 8601 due date, if set."),
   project_id: z.number().nullable().optional().describe("Owning project id."),
+  bucket_id: z.number().nullable().optional().describe("Bucket id the task currently sits in, scoped to whichever view last placed it."),
+  placement: z.object({
+    viewId: z.number(),
+    bucketId: z.number(),
+    bucketTitle: z.string()
+  }).optional().describe("Kanban bucket this run placed the task into (absent when placement was disabled or the task already existed)."),
   created: z.string().nullable().optional().describe("Creation timestamp from Vikunja."),
   updated: z.string().nullable().optional().describe("Last-update timestamp from Vikunja."),
   fetchedAt: z.string().describe("ISO 8601 timestamp when this record was written."),
@@ -35,26 +83,123 @@ var SummarySchema = z.object({
   ids: z.array(z.number()).default([]),
   fetchedAt: z.string()
 }).passthrough();
-var PriorityLabel = z.enum([
-  "Urgent",
-  "High",
-  "Medium"
-]).describe("Label name to attach to the task, resolved via GET /labels. Must already exist on the Vikunja instance \u2014 this model never creates labels.");
+var FindingSchema = z.object({
+  taskId: z.number().nullable().describe("Task the finding is about; null for bucket-level findings."),
+  title: z.string().nullable(),
+  bucket: z.string(),
+  role: z.string().describe("Bucket role (backlog/ready/doing/blocked/review/done/other)."),
+  rule: z.string().describe("Rule id, e.g. empty-description, stale, wip-exceeded."),
+  severity: z.enum([
+    "error",
+    "warn",
+    "info"
+  ]),
+  detail: z.string()
+});
+var BoardAuditSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  auditedAt: z.string(),
+  buckets: z.array(z.object({
+    title: z.string(),
+    role: z.string(),
+    count: z.number(),
+    inOrder: z.boolean()
+  })),
+  findings: z.array(FindingSchema),
+  counts: z.object({
+    findings: z.number(),
+    bySeverity: z.record(z.string(), z.number()),
+    byRule: z.record(z.string(), z.number())
+  }),
+  ready: z.object({
+    bucket: z.string(),
+    total: z.number(),
+    passing: z.number(),
+    failingIds: z.array(z.number())
+  }).describe("Definition-of-Ready roll-up for the ready column: a card passes when it has no error-level findings.")
+}).passthrough();
+var ReorderPlanSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  plannedAt: z.string(),
+  applied: z.boolean(),
+  converged: z.boolean().describe("True when the final re-read of every bucket matched the intended order (always false on a dry run that still has pending moves)."),
+  iterations: z.number(),
+  moves: z.array(z.object({
+    taskId: z.number(),
+    title: z.string(),
+    bucket: z.string(),
+    from: z.number().describe("0-based index before."),
+    to: z.number().describe("0-based index after.")
+  }))
+}).passthrough();
+var DueItemSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  bucket: z.string(),
+  dueDate: z.string().describe("ISO 8601 due date as Vikunja stores it."),
+  daysUntil: z.number().int().describe("Whole UTC days from the report's `asOf` date to the due date: negative = overdue, 0 = due today."),
+  url: z.string().describe("Task link, built from webBaseUrl (or baseUrl).")
+});
+var DueReportSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  asOf: z.string().describe("ISO 8601 instant the board was read at."),
+  lookaheadDays: z.number().int(),
+  counts: z.object({
+    overdue: z.number(),
+    dueToday: z.number(),
+    upcoming: z.number(),
+    actionable: z.number().describe("overdue + dueToday \u2014 what the nudge fires on.")
+  }),
+  overdue: z.array(DueItemSchema),
+  dueToday: z.array(DueItemSchema),
+  upcoming: z.array(DueItemSchema).describe("Due after today and within lookaheadDays, soonest first."),
+  message: z.string().describe("Ready-to-send Markdown body listing every section that is non-empty."),
+  boardUrl: z.string()
+}).passthrough();
+var LabelName = z.string().min(1).describe("Label title to attach to the task (case-insensitive), resolved via GET /labels. Must already exist on the Vikunja instance \u2014 this model never creates labels.");
+var ProjectIdOverride = z.number().int().positive().optional().describe("Target a different Vikunja project than the configured default projectId.");
 var NewTaskArgsSchema = z.object({
   title: z.string().min(1, "title must not be empty").describe("Task title."),
+  projectId: ProjectIdOverride,
   description: z.string().optional().describe("Optional task description/body."),
-  label: PriorityLabel.optional(),
+  label: LabelName.optional(),
   dueDate: z.string().optional().describe("Optional ISO 8601 due date, e.g. 2026-09-20T00:00:00Z."),
   priority: z.number().int().min(0).max(5).optional().describe("Optional Vikunja numeric priority override (0=unset .. 5=DO NOW)."),
+  bucketName: z.string().optional().describe("Kanban bucket title (case-insensitive) to place the task into, overriding the configured defaultBucketName. Must exist in the target project's kanban view \u2014 resolved before the task is created, so an unknown name fails with nothing created. Empty string disables placement for this call."),
   skipIfTitleExists: z.boolean().default(true).describe("If true (default), checks for a non-done task with the exact same title in the project first and skips creation (idempotency without a dedicated dedup key \u2014 Vikunja has no idempotency-key concept).")
 });
+var AuditArgsSchema = z.object({
+  projectId: ProjectIdOverride
+});
+var DueReportArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+  lookaheadDays: z.number().int().min(0).max(365).default(7).describe("Cards due within this many days after today are listed as upcoming. 0 lists only overdue and due-today cards."),
+  now: z.string().optional().describe("ISO 8601 instant to evaluate against instead of the clock (for tests and dry runs).")
+});
+var SetDueDateArgsSchema = z.object({
+  taskId: z.number().int().positive().describe("Vikunja task id."),
+  dueDate: z.string().describe("ISO 8601 instant to set as the due date (the day to look at the card again), e.g. 2026-11-04T17:00:00Z. An empty string clears it."),
+  projectId: ProjectIdOverride.describe("Project whose kanban view is read to assert the card's bucket did not change. Defaults to the configured projectId.")
+});
+var ReorderArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+  apply: z.boolean().default(false).describe("false (default) only reports the moves that would be made. true performs them one at a time \u2014 read the bucket, move the first card that is out of place to the midpoint of its intended neighbours, re-read, repeat \u2014 and fails if the board has not converged."),
+  buckets: z.array(z.string()).optional().describe("Bucket titles (case-insensitive) to reorder. Default: every bucket except the done role."),
+  maxIterations: z.number().int().min(1).max(500).default(100).describe("Upper bound on single-card moves before reorder gives up.")
+});
 var ListRecentArgsSchema = z.object({
+  projectId: ProjectIdOverride,
   limit: z.number().int().min(1).max(50).default(10).describe("Max results to return."),
   includeDone: z.boolean().default(false).describe("Include tasks already marked done.")
 });
 function resolveBase(g) {
   const trimmed = g.baseUrl.trim().replace(/\/+$/, "");
-  if (!trimmed) throw new Error("Vikunja `baseUrl` resolves to an empty string.");
+  if (!trimmed) {
+    throw new Error("Vikunja `baseUrl` resolves to an empty string.");
+  }
   if (!/^https?:\/\//i.test(trimmed)) {
     throw new Error(`Invalid Vikunja baseUrl "${g.baseUrl}": must start with http:// or https://.`);
   }
@@ -67,7 +212,9 @@ function backoffMs(res) {
   const retryAfter = res.headers.get("Retry-After");
   if (retryAfter) {
     const secs = Number(retryAfter);
-    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1e3, 6e4);
+    if (Number.isFinite(secs) && secs >= 0) {
+      return Math.min(secs * 1e3, 6e4);
+    }
   }
   return 1e3;
 }
@@ -125,6 +272,33 @@ async function resolveLabelId(g, labelName) {
   const match = labels.find((l) => typeof l.title === "string" && l.title.toLowerCase() === labelName.toLowerCase());
   return match && typeof match.id === "number" ? match.id : null;
 }
+async function resolveKanbanViewId(g, projectId) {
+  if (g.viewId !== void 0 && projectId === g.projectId) return g.viewId;
+  const views = asArray(await vreq(g, "GET", `/projects/${projectId}/views`));
+  const kanban = views.find((v) => v.view_kind === "kanban");
+  return kanban && typeof kanban.id === "number" ? kanban.id : null;
+}
+async function resolveBucket(g, projectId, viewId, bucketName) {
+  const buckets = asArray(await vreq(g, "GET", `/projects/${projectId}/views/${viewId}/buckets`));
+  const match = buckets.find((b) => typeof b.title === "string" && b.title.toLowerCase() === bucketName.toLowerCase());
+  if (match && typeof match.id === "number" && typeof match.title === "string") {
+    return {
+      id: match.id,
+      title: match.title
+    };
+  }
+  const available = buckets.map((b) => typeof b.title === "string" ? `"${b.title}"` : null).filter((t) => t !== null).join(", ");
+  throw new Error(`Bucket "${bucketName}" not found in project ${projectId} view ${viewId}` + (available ? `; available: ${available}` : "; the view has no buckets"));
+}
+async function moveTaskToBucket(g, projectId, viewId, bucketId, taskId) {
+  await vreq(g, "POST", `/projects/${projectId}/views/${viewId}/buckets/${bucketId}/tasks`, {
+    body: {
+      task_id: taskId,
+      bucket_id: bucketId,
+      project_view_id: viewId
+    }
+  });
+}
 function toVikunjaTask(raw, fetchedAt) {
   return VikunjaTaskSchema.parse({
     ...raw,
@@ -135,8 +309,9 @@ function toVikunjaTask(raw, fetchedAt) {
 async function newTask(args, ctx) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const projectId = args.projectId ?? g.projectId;
   if (args.skipIfTitleExists) {
-    const existing = asArray(await vreq(g, "GET", `/projects/${g.projectId}/tasks`, {
+    const existing = asArray(await vreq(g, "GET", `/projects/${projectId}/tasks`, {
       search: {
         s: args.title,
         per_page: "50"
@@ -146,7 +321,8 @@ async function newTask(args, ctx) {
     if (dup && typeof dup.id === "number") {
       ctx.logger?.info("Task with matching title already exists \u2014 skipping create", {
         title: args.title,
-        existingId: dup.id
+        existingId: dup.id,
+        projectId
       });
       const handle2 = await ctx.writeResource("vikunjaTask", `task-${dup.id}`, toVikunjaTask(dup, fetchedAt));
       return {
@@ -156,13 +332,31 @@ async function newTask(args, ctx) {
       };
     }
   }
+  const bucketName = args.bucketName ?? g.defaultBucketName;
+  let target = null;
+  if (bucketName) {
+    const viewId = await resolveKanbanViewId(g, projectId);
+    if (viewId === null) {
+      ctx.logger?.warning("Project has no kanban view \u2014 skipping bucket placement", {
+        projectId,
+        bucketName
+      });
+    } else {
+      const bucket = await resolveBucket(g, projectId, viewId, bucketName);
+      target = {
+        viewId,
+        bucketId: bucket.id,
+        bucketTitle: bucket.title
+      };
+    }
+  }
   const body = {
     title: args.title
   };
   if (args.description) body.description = args.description;
   if (args.dueDate) body.due_date = args.dueDate;
   if (args.priority !== void 0) body.priority = args.priority;
-  const created = await vreq(g, "PUT", `/projects/${g.projectId}/tasks`, {
+  const created = await vreq(g, "PUT", `/projects/${projectId}/tasks`, {
     body
   });
   const taskId = typeof created.id === "number" ? created.id : null;
@@ -192,10 +386,27 @@ async function newTask(args, ctx) {
       }
     }
   }
+  if (target) {
+    try {
+      await moveTaskToBucket(g, projectId, target.viewId, target.bucketId, taskId);
+    } catch (e) {
+      throw new Error(`Task ${taskId} was created in project ${projectId} but could not be moved into bucket "${target.bucketTitle}" (view ${target.viewId}, bucket ${target.bucketId}): ` + (e instanceof Error ? e.message : String(e)));
+    }
+    ctx.logger?.info(`Placed task ${taskId} into bucket "${target.bucketTitle}"`, {
+      projectId,
+      viewId: target.viewId,
+      bucketId: target.bucketId
+    });
+  }
   const final = await vreq(g, "GET", `/tasks/${taskId}`);
-  const handle = await ctx.writeResource("vikunjaTask", `task-${taskId}`, toVikunjaTask(final, fetchedAt));
+  const handle = await ctx.writeResource("vikunjaTask", `task-${taskId}`, toVikunjaTask(target ? {
+    ...final,
+    placement: target
+  } : final, fetchedAt));
   ctx.logger?.info(`Vikunja task created: ${taskId}`, {
-    title: args.title
+    title: args.title,
+    projectId,
+    bucket: target?.bucketTitle ?? null
   });
   return {
     dataHandles: [
@@ -206,7 +417,8 @@ async function newTask(args, ctx) {
 async function listRecent(args, ctx) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = (/* @__PURE__ */ new Date()).toISOString();
-  const endpoint = `/projects/${g.projectId}/tasks`;
+  const projectId = args.projectId ?? g.projectId;
+  const endpoint = `/projects/${projectId}/tasks`;
   const tasks = asArray(await vreq(g, "GET", endpoint, {
     search: {
       sort_by: "created",
@@ -238,13 +450,565 @@ async function listRecent(args, ctx) {
     dataHandles: handles
   };
 }
+function roleOf(title, roles) {
+  const t = title.toLowerCase();
+  for (const [role, name] of Object.entries(roles)) {
+    if (name.toLowerCase() === t) return role;
+  }
+  return "other";
+}
+function textLength(html) {
+  return html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").trim().replace(/\s+/g, " ").length;
+}
+function toBoardTask(raw) {
+  if (typeof raw.id !== "number") return null;
+  return {
+    id: raw.id,
+    title: typeof raw.title === "string" ? raw.title : "",
+    description: typeof raw.description === "string" ? raw.description : "",
+    done: raw.done === true,
+    priority: typeof raw.priority === "number" ? raw.priority : 0,
+    position: typeof raw.position === "number" ? raw.position : 0,
+    created: typeof raw.created === "string" ? raw.created : "",
+    updated: typeof raw.updated === "string" ? raw.updated : "",
+    labels: asArray(raw.labels).map((l) => l.title).filter((t) => typeof t === "string"),
+    dueDate: dueDateOf(raw.due_date)
+  };
+}
+function dueDateOf(raw) {
+  if (typeof raw !== "string" || raw === "") return null;
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t) || t < 0) return null;
+  return raw;
+}
+async function fetchBoard(g, projectId, viewId) {
+  const info = await vreq(g, "GET", "/info").catch(() => null);
+  const perPage = info && typeof info.max_items_per_page === "number" ? info.max_items_per_page : 50;
+  const buckets = /* @__PURE__ */ new Map();
+  for (let page = 1; page <= 100; page++) {
+    const raw = asArray(await vreq(g, "GET", `/projects/${projectId}/views/${viewId}/tasks`, {
+      search: {
+        page: String(page),
+        per_page: String(perPage)
+      }
+    }));
+    let grew = false;
+    for (const b of raw) {
+      if (typeof b.id !== "number") continue;
+      const bucket = buckets.get(b.id) ?? {
+        id: b.id,
+        title: typeof b.title === "string" ? b.title : String(b.id),
+        position: typeof b.position === "number" ? b.position : 0,
+        tasks: []
+      };
+      const seen = new Set(bucket.tasks.map((t) => t.id));
+      for (const t of asArray(b.tasks)) {
+        const task = toBoardTask(t);
+        if (task && !seen.has(task.id)) {
+          bucket.tasks.push(task);
+          seen.add(task.id);
+          grew = true;
+        }
+      }
+      buckets.set(b.id, bucket);
+    }
+    if (!grew) break;
+  }
+  const out = [
+    ...buckets.values()
+  ].sort((a, b) => a.position - b.position);
+  for (const b of out) b.tasks.sort((a, c) => a.position - c.position);
+  return out;
+}
+function intendedOrder(tasks, tieBreak, role = "other") {
+  return [
+    ...tasks
+  ].sort((a, b) => {
+    if (role === "waiting") {
+      const da = a.dueDate === null ? Infinity : Date.parse(a.dueDate);
+      const db = b.dueDate === null ? Infinity : Date.parse(b.dueDate);
+      if (da !== db) return da - db;
+    }
+    if (a.priority !== b.priority) return b.priority - a.priority;
+    const cmp = a.created.localeCompare(b.created);
+    return tieBreak === "oldest" ? cmp : -cmp;
+  });
+}
+function sameOrder(a, b) {
+  return a.length === b.length && a.every((t, i) => t.id === b[i].id);
+}
+function daysBetween(fromIso, now) {
+  const t = Date.parse(fromIso);
+  if (!Number.isFinite(t)) return null;
+  return (now.getTime() - t) / 864e5;
+}
+function auditCard(task, bucket, role, policy, now) {
+  const out = [];
+  const add = (rule, severity, detail) => out.push({
+    taskId: task.id,
+    title: task.title,
+    bucket,
+    role,
+    rule,
+    severity,
+    detail
+  });
+  if (role === "done") {
+    if (!task.done) {
+      add("done-flag-mismatch", "warn", "in the done bucket but done=false");
+    }
+    return out;
+  }
+  if (task.done) {
+    add("done-flag-mismatch", "warn", "done=true outside the done bucket");
+  }
+  const executable = role === "ready" || role === "doing" || role === "review";
+  const must = executable ? "error" : "warn";
+  if (role === "waiting") {
+    if (task.dueDate === null) {
+      add("missing-due-date", "error", "waiting with no due date \u2014 set the day to look at it again");
+    } else {
+      const overBy = utcDay(now.getTime()) - utcDay(Date.parse(task.dueDate));
+      if (overBy > 0) {
+        add("stale", "warn", `due date passed ${overBy} d ago \u2014 act on it or re-date it`);
+      }
+    }
+  }
+  const len = textLength(task.description);
+  if (len === 0) add("empty-description", "error", "description is empty");
+  else if (len < policy.minDescriptionChars) {
+    add("short-description", must, `${len} chars < ${policy.minDescriptionChars}`);
+  }
+  if (task.labels.length === 0) add("no-labels", must, "no labels at all");
+  else {
+    for (const prefix of policy.requiredLabelPrefixes) {
+      if (!task.labels.some((l) => l.toLowerCase().startsWith(prefix.toLowerCase()))) {
+        add("missing-label-group", must, `no label starting with "${prefix}"`);
+      }
+    }
+    const isGroup = (l) => policy.requiredLabelPrefixes.some((p) => l.toLowerCase().startsWith(p.toLowerCase()));
+    if (!task.labels.some((l) => !isGroup(l))) {
+      add("missing-area-label", must, "only group labels, no area label");
+    }
+  }
+  if (task.priority === 0) add("priority-unset", must, "priority is 0 (unset)");
+  if (len > 0) {
+    const desc = task.description;
+    if (!policy.verdictMarkers.some((m) => desc.includes(m))) {
+      add("missing-verdict", executable ? "error" : "info", `no premise-check verdict (${policy.verdictMarkers.join("/")})`);
+    }
+    const lower = desc.toLowerCase();
+    if (!policy.acceptanceMarkers.some((m) => lower.includes(m.toLowerCase()))) {
+      add("missing-acceptance", executable ? "error" : "info", `no acceptance marker (${policy.acceptanceMarkers.join("/")})`);
+    }
+    if (policy.requiredLinkPrefix && !desc.includes(policy.requiredLinkPrefix)) {
+      add("missing-link", must, `no ${policy.requiredLinkPrefix} link to the source note`);
+    }
+  }
+  const staleAfter = policy.staleDays[role];
+  if (staleAfter !== void 0) {
+    const age = daysBetween(task.updated, now);
+    if (age !== null && age > staleAfter) {
+      add("stale", "warn", `untouched for ${age.toFixed(1)} d (limit ${staleAfter} d in ${bucket})`);
+    }
+  }
+  return out;
+}
+function auditBucket(bucket, role, policy) {
+  const findings = [];
+  const inOrder = role === "done" || sameOrder(bucket.tasks, intendedOrder(bucket.tasks, policy.tieBreak, role));
+  if (!inOrder) {
+    findings.push({
+      taskId: null,
+      title: null,
+      bucket: bucket.title,
+      role,
+      rule: "out-of-order",
+      severity: "warn",
+      detail: "not sorted by priority desc, then age \u2014 run reorder"
+    });
+  }
+  if (role === "doing" && bucket.tasks.length > policy.wipLimit) {
+    findings.push({
+      taskId: null,
+      title: null,
+      bucket: bucket.title,
+      role,
+      rule: "wip-exceeded",
+      severity: "warn",
+      detail: `${bucket.tasks.length} cards > wipLimit ${policy.wipLimit}`
+    });
+  }
+  return {
+    findings,
+    inOrder
+  };
+}
+function nextMove(current, intended) {
+  for (let i = 0; i < intended.length; i++) {
+    if (current[i]?.id === intended[i].id) continue;
+    const task = intended[i];
+    const lo = i > 0 ? current[i - 1].position : 0;
+    const hi = current[i]?.position ?? lo + 65536;
+    const position = hi > lo ? (lo + hi) / 2 : lo + 1;
+    return {
+      task,
+      index: i,
+      position
+    };
+  }
+  return null;
+}
+async function requireKanbanView(g, projectId) {
+  const viewId = await resolveKanbanViewId(g, projectId);
+  if (viewId === null) {
+    throw new Error(`Project ${projectId} has no kanban view.`);
+  }
+  return viewId;
+}
+async function audit(args, ctx) {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const now = /* @__PURE__ */ new Date();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  const findings = [];
+  const buckets = [];
+  const ready = {
+    bucket: g.bucketRoles.ready,
+    total: 0,
+    passing: 0,
+    failingIds: []
+  };
+  for (const b of board) {
+    const role = roleOf(b.title, g.bucketRoles);
+    const { findings: bf, inOrder } = auditBucket(b, role, g.policy);
+    findings.push(...bf);
+    buckets.push({
+      title: b.title,
+      role,
+      count: b.tasks.length,
+      inOrder
+    });
+    for (const t of b.tasks) {
+      const cf = auditCard(t, b.title, role, g.policy, now);
+      findings.push(...cf);
+      if (role === "ready") {
+        ready.total++;
+        if (cf.some((f) => f.severity === "error")) ready.failingIds.push(t.id);
+        else ready.passing++;
+      }
+    }
+  }
+  const bySeverity = {};
+  const byRule = {};
+  for (const f of findings) {
+    bySeverity[f.severity] = (bySeverity[f.severity] ?? 0) + 1;
+    byRule[f.rule] = (byRule[f.rule] ?? 0) + 1;
+  }
+  const report = BoardAuditSchema.parse({
+    projectId,
+    viewId,
+    auditedAt: now.toISOString(),
+    buckets,
+    findings,
+    counts: {
+      findings: findings.length,
+      bySeverity,
+      byRule
+    },
+    ready
+  });
+  const handle = await ctx.writeResource("boardAudit", `audit-${projectId}`, report);
+  ctx.logger?.info(`Audited project ${projectId}: ${buckets.reduce((n, b) => n + b.count, 0)} cards, ${findings.length} findings, ready ${ready.passing}/${ready.total}`, {
+    bySeverity,
+    byRule
+  });
+  return {
+    dataHandles: [
+      handle
+    ]
+  };
+}
+function utcDay(ms) {
+  return Math.floor(ms / 864e5);
+}
+function classifyDue(board, roles, now, lookaheadDays, webBase) {
+  const today = utcDay(now.getTime());
+  const overdue = [];
+  const dueToday = [];
+  const upcoming = [];
+  for (const b of board) {
+    if (roleOf(b.title, roles) === "done") continue;
+    for (const t of b.tasks) {
+      if (t.done || t.dueDate === null) continue;
+      const due = Date.parse(t.dueDate);
+      if (!Number.isFinite(due)) continue;
+      const daysUntil = utcDay(due) - today;
+      const item = {
+        id: t.id,
+        title: t.title,
+        bucket: b.title,
+        dueDate: t.dueDate,
+        daysUntil,
+        url: `${webBase}/tasks/${t.id}`
+      };
+      if (daysUntil < 0) overdue.push(item);
+      else if (daysUntil === 0) dueToday.push(item);
+      else if (daysUntil <= lookaheadDays) upcoming.push(item);
+    }
+  }
+  const soonest = (a, b) => a.daysUntil - b.daysUntil || a.id - b.id;
+  overdue.sort(soonest);
+  dueToday.sort(soonest);
+  upcoming.sort(soonest);
+  return {
+    overdue,
+    dueToday,
+    upcoming
+  };
+}
+function dueLine(i) {
+  const when = i.daysUntil < 0 ? `${-i.daysUntil}d overdue` : i.daysUntil === 0 ? "today" : `in ${i.daysUntil}d`;
+  return `- [#${i.id}](${i.url}) ${i.title} \u2014 ${i.dueDate.slice(0, 10)} (${when}, ${i.bucket})`;
+}
+function renderDueMessage(r, lookaheadDays, boardUrl) {
+  const parts = [];
+  if (r.overdue.length > 0) {
+    parts.push(`**Overdue (${r.overdue.length})**
+` + r.overdue.map(dueLine).join("\n"));
+  }
+  if (r.dueToday.length > 0) {
+    parts.push(`**Due today (${r.dueToday.length})**
+` + r.dueToday.map(dueLine).join("\n"));
+  }
+  if (r.upcoming.length > 0) {
+    parts.push(`**Next ${lookaheadDays} days (${r.upcoming.length})**
+` + r.upcoming.map(dueLine).join("\n"));
+  }
+  if (parts.length === 0) parts.push("Nothing due.");
+  parts.push(`Board: ${boardUrl}`);
+  return parts.join("\n\n");
+}
+async function dueReport(args, ctx) {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const now = args.now ? new Date(args.now) : /* @__PURE__ */ new Date();
+  if (!Number.isFinite(now.getTime())) {
+    throw new Error(`now is not a parseable instant: ${args.now}`);
+  }
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  const webBase = (g.webBaseUrl ?? g.baseUrl).replace(/\/+$/, "");
+  const boardUrl = `${webBase}/projects/${projectId}`;
+  const lists = classifyDue(board, g.bucketRoles, now, args.lookaheadDays, webBase);
+  const report = DueReportSchema.parse({
+    projectId,
+    viewId,
+    asOf: now.toISOString(),
+    lookaheadDays: args.lookaheadDays,
+    counts: {
+      overdue: lists.overdue.length,
+      dueToday: lists.dueToday.length,
+      upcoming: lists.upcoming.length,
+      actionable: lists.overdue.length + lists.dueToday.length
+    },
+    ...lists,
+    message: renderDueMessage(lists, args.lookaheadDays, boardUrl),
+    boardUrl
+  });
+  const handle = await ctx.writeResource("dueReport", `due-${projectId}`, report);
+  ctx.logger?.info(`Due report for project ${projectId}: ${report.counts.overdue} overdue, ${report.counts.dueToday} due today, ${report.counts.upcoming} upcoming`, {
+    asOf: report.asOf,
+    lookaheadDays: args.lookaheadDays
+  });
+  return {
+    dataHandles: [
+      handle
+    ]
+  };
+}
+async function bucketTitleOf(g, projectId, viewId, taskId) {
+  const board = await fetchBoard(g, projectId, viewId);
+  for (const b of board) {
+    if (b.tasks.some((t) => t.id === taskId)) return b.title;
+  }
+  return null;
+}
+async function setDueDate(args, ctx) {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const wanted = args.dueDate.trim() === "" ? null : args.dueDate.trim();
+  if (wanted !== null && !Number.isFinite(Date.parse(wanted))) {
+    throw new Error(`dueDate is not a parseable instant: ${args.dueDate}`);
+  }
+  const viewId = await requireKanbanView(g, projectId);
+  const bucketBefore = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  if (bucketBefore === null) {
+    throw new Error(`Task ${args.taskId} is not on project ${projectId}'s kanban view.`);
+  }
+  const full = await vreq(g, "GET", `/tasks/${args.taskId}`);
+  if (full.done === true) {
+    throw new Error(`Task ${args.taskId} is done; not touching a done card.`);
+  }
+  const before = dueDateOf(full.due_date);
+  if (before === null && wanted === null || before !== null && wanted !== null && Date.parse(before) === Date.parse(wanted)) {
+    ctx.logger?.info(`Task ${args.taskId}: due date already ${wanted}`);
+  } else {
+    await vreq(g, "POST", `/tasks/${args.taskId}`, {
+      body: {
+        ...full,
+        due_date: wanted
+      }
+    });
+  }
+  const after = await vreq(g, "GET", `/tasks/${args.taskId}`);
+  const got = dueDateOf(after.due_date);
+  const matches = wanted === null ? got === null : got !== null && Date.parse(got) === Date.parse(wanted);
+  if (!matches) {
+    throw new Error(`Task ${args.taskId}: due date read back as ${got}, wanted ${wanted}.`);
+  }
+  const bucketAfter = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  if (bucketAfter !== bucketBefore) {
+    throw new Error(`Task ${args.taskId}: due date is set but the card moved from bucket "${bucketBefore}" to "${bucketAfter}" \u2014 a full-replace write un-bucketed it; move it back by hand.`);
+  }
+  const handle = await ctx.writeResource("vikunjaTask", `task-${args.taskId}`, toVikunjaTask(after, fetchedAt));
+  ctx.logger?.info(`Task ${args.taskId}: due date ${before} -> ${got}`, {
+    bucket: bucketAfter
+  });
+  return {
+    dataHandles: [
+      handle
+    ]
+  };
+}
+async function reorder(args, ctx) {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const plannedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const wanted = args.buckets?.map((b) => b.toLowerCase());
+  const inScope = (title) => wanted ? wanted.includes(title.toLowerCase()) : roleOf(title, g.bucketRoles) !== "done";
+  const orderOf = (b) => intendedOrder(b.tasks, g.policy.tieBreak, roleOf(b.title, g.bucketRoles));
+  let board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  if (wanted) {
+    const titles = board.map((b) => b.title.toLowerCase());
+    const missing = wanted.filter((w) => !titles.includes(w));
+    if (missing.length) {
+      throw new Error(`Unknown bucket(s): ${missing.join(", ")}`);
+    }
+  }
+  const moves = [];
+  for (const b of board) {
+    if (!inScope(b.title)) continue;
+    const intended = orderOf(b);
+    b.tasks.forEach((t, from) => {
+      const to = intended.findIndex((x) => x.id === t.id);
+      if (to !== from) {
+        moves.push({
+          taskId: t.id,
+          title: t.title,
+          bucket: b.title,
+          from,
+          to
+        });
+      }
+    });
+  }
+  let iterations = 0;
+  let converged = moves.length === 0;
+  if (args.apply && moves.length > 0) {
+    for (const bucketTitle of board.filter((b) => inScope(b.title)).map((b) => b.title)) {
+      for (; ; ) {
+        const b = board.find((x) => x.title === bucketTitle);
+        if (!b) {
+          throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
+        }
+        const move = nextMove(b.tasks, orderOf(b));
+        if (!move) break;
+        if (iterations >= args.maxIterations) {
+          throw new Error(`reorder did not converge after ${iterations} moves (bucket "${bucketTitle}" still out of order).`);
+        }
+        iterations++;
+        await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
+          body: {
+            project_view_id: viewId,
+            task_id: move.task.id,
+            position: move.position
+          }
+        });
+        ctx.logger?.info(`Moved #${move.task.id} to slot ${move.index} in "${bucketTitle}"`, {
+          position: move.position
+        });
+        board = await fetchBoard(g, projectId, viewId);
+      }
+    }
+    converged = board.filter((b) => inScope(b.title)).every((b) => sameOrder(b.tasks, orderOf(b)));
+    if (!converged) {
+      throw new Error("reorder finished its moves but a final re-read is still out of order.");
+    }
+  }
+  const plan = ReorderPlanSchema.parse({
+    projectId,
+    viewId,
+    plannedAt,
+    applied: args.apply,
+    converged,
+    iterations,
+    moves
+  });
+  const handle = await ctx.writeResource("reorderPlan", `reorder-${projectId}`, plan);
+  ctx.logger?.info(args.apply ? `Reordered project ${projectId}: ${iterations} moves, converged=${converged}` : `Dry run for project ${projectId}: ${moves.length} card(s) out of place (apply: true to fix)`);
+  return {
+    dataHandles: [
+      handle
+    ]
+  };
+}
 var model = {
   type: "@sntxrr/vikunja-kanban",
-  version: "2026.09.13.1",
+  version: "2026.09.19.2",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.09.13.2",
+      description: "Added defaultBucketName global arg and bucketName method arg for placing new tasks into a named bucket (e.g. Review) within a configured view, so automation-created tasks land in a human triage column instead of a working column. Added bucket_id to the vikunjaTask resource schema. No breaking changes \u2014 both new fields are optional/defaulted.",
+      upgradeAttributes: (old) => old
+    },
+    {
+      toVersion: "2026.09.14.1",
+      description: `Bucket placement now works without a configured viewId: the project's kanban view is auto-discovered, the bucket is resolved before the task is created (unknown name = error, nothing created), the move uses the POST endpoint Vikunja v2.x serves (the previous PUT silently failed), and a failed move is an error instead of a warning. defaultBucketName default changed from "Review" to "Backlog". Added optional projectId argument to new_task and list_recent to target another project per call, and a placement field on the vikunjaTask resource. Existing model attributes carry over unchanged.`,
+      upgradeAttributes: (old) => old
+    },
+    {
+      toVersion: "2026.09.15.1",
+      description: "Added audit (read-only Definition-of-Ready findings per card and bucket, written as a boardAudit resource) and reorder (sorts every non-done bucket by priority desc then age; dry-run by default, apply: true moves one card at a time and re-reads until the board converges), plus bucketRoles and policy global args with defaults for both. new_task's label argument now accepts any existing label title instead of the Urgent/High/Medium enum. Existing model attributes carry over unchanged.",
+      upgradeAttributes: (old) => old
+    },
+    {
+      toVersion: "2026.09.19.1",
+      description: "Added due_report: reads the board and writes a dueReport resource splitting dated, not-done cards into overdue / due today / upcoming (lookaheadDays, default 7) with a ready-to-send Markdown message, so a scheduled workflow can nudge on a card's due date. Added optional webBaseUrl global arg for task links when the API is called on a different address than the web UI. Existing model attributes carry over unchanged.",
+      upgradeAttributes: (old) => old
+    },
+    {
+      toVersion: "2026.09.19.2",
+      description: "Added set_due_date: set or clear one card's due date via a read-modify-write of the full task (POST /tasks/{id} is a full replace), refusing done cards and asserting on read-back that the date took and the card's bucket did not change. Existing model attributes carry over unchanged.",
+      upgradeAttributes: (old) => old
+    }
+  ],
   resources: {
     vikunjaTask: {
-      description: "A Vikunja task with id, title, labels, priority, and status.",
+      description: "A Vikunja task with id, title, labels, priority, bucket, and status.",
       schema: VikunjaTaskSchema,
       lifetime: "infinite",
       garbageCollection: 50
@@ -254,23 +1018,70 @@ var model = {
       schema: SummarySchema,
       lifetime: "infinite",
       garbageCollection: 20
+    },
+    boardAudit: {
+      description: "One audit run of a kanban board: per-card and per-bucket Definition-of-Ready findings, counts by rule and severity, and the ready-column pass/fail roll-up.",
+      schema: BoardAuditSchema,
+      lifetime: "infinite",
+      garbageCollection: 30
+    },
+    reorderPlan: {
+      description: "One reorder run: the moves planned (dry run) or performed (apply), and whether the board converged to the intended order.",
+      schema: ReorderPlanSchema,
+      lifetime: "infinite",
+      garbageCollection: 30
+    },
+    dueReport: {
+      description: "One due-date pass over a board: overdue, due-today and upcoming cards with counts and a Markdown message ready to send.",
+      schema: DueReportSchema,
+      lifetime: "infinite",
+      garbageCollection: 30
     }
   },
   methods: {
+    audit: {
+      description: "Read-only Definition-of-Ready audit of a project's kanban board: empty/short descriptions, missing labels or label groups, unset priority, missing verdict/acceptance/source-link markers, stale cards per role, WIP over the limit, and buckets out of order. Writes a boardAudit resource; changes nothing.",
+      arguments: AuditArgsSchema,
+      execute: audit
+    },
+    reorder: {
+      description: "Sort each non-done bucket by priority (desc) then age. Dry run by default \u2014 reports the cards out of place. With apply: true, moves one card at a time to the midpoint of its intended neighbours and re-reads the board after every move (Vikunja re-derives positions on write, so batch-assigned positions drift), failing loudly if the board does not converge.",
+      arguments: ReorderArgsSchema,
+      execute: reorder
+    },
+    due_report: {
+      description: "Read-only: list the not-done cards on a project's board that are overdue, due today, or due within lookaheadDays, each with a link, and write a dueReport resource whose `message` is ready to send. Treat a card's due date as the day to look at it again; a daily workflow gated on counts.actionable > 0 turns that into a nudge.",
+      arguments: DueReportArgsSchema,
+      execute: dueReport
+    },
+    set_due_date: {
+      description: "Set or clear one card's due date \u2014 the day to look at it again. Reads the full task, writes it back with only due_date changed (Vikunja's POST /tasks/{id} is a full replace), re-reads and asserts the date took and the card is still in the same bucket. Refuses done cards. Records the task as a vikunjaTask resource.",
+      arguments: SetDueDateArgsSchema,
+      execute: setDueDate
+    },
     new_task: {
-      description: "Create a task in the configured Vikunja project, optionally attaching an existing label by name (Urgent/High/Medium) and skipping creation if a non-done task with the same title already exists.",
+      description: `Create a task in a Vikunja project (the configured default, or a per-call projectId) and place it into a named kanban bucket (default "Backlog", override with bucketName) so it lands in a backlog column rather than the view's default working column. Optionally attaches an existing label by name (Urgent/High/Medium) and skips creation if a non-done task with the same title already exists.`,
       arguments: NewTaskArgsSchema,
       execute: newTask
     },
     list_recent: {
-      description: "List the most recently created tasks in the configured Vikunja project and record each as swamp data.",
+      description: "List the most recently created tasks in a Vikunja project (the configured default, or a per-call projectId) and record each as swamp data.",
       arguments: ListRecentArgsSchema,
       execute: listRecent
     }
   }
 };
 export {
+  auditBucket,
+  auditCard,
   backoffMs,
+  classifyDue,
+  dueDateOf,
+  intendedOrder,
   model,
-  resolveBase
+  nextMove,
+  renderDueMessage,
+  resolveBase,
+  roleOf,
+  textLength
 };
