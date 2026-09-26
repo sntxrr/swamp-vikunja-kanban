@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.09.26.1",
+  "reviewedAt": "2026-09-26T19:33:02Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "apiToken is .meta({sensitive:true}) and supplied by vault reference; new methods add no credential fields and never log the token (vreq errors carry method/path/status/body only)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "issue",
+      "note": "Follow-up, pre-existing style: completion logs exist for every method but use template-string interpolation (9 calls) rather than structured placeholders, and there is no entry-level info log. No sensitive values are logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every refusal (done card, empty description, unknown label, done bucket, missing humanInstructed) throws before any write. Every write is read back and a mismatch throws naming the task and fields before writeResource. new_task: a label-attach failure after creation throws naming the created task id (card left in the view's default bucket, stated in the message). guardWrite's readResource .catch falls through to REFUSE, the safe direction."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "12 new tests drive each method through model.methods[...].execute against an in-memory fake Vikunja behind a stubbed fetch, with readResource/writeResource seeded. They cover success paths and every refusal, a write that drops the card out of its bucket, and a field that doesn't read back. Mutation-checked: disabling the guard or the bucket restore each fails a test. Uses a hand-rolled stub, not withMockedFetch/createModelTestContext. The older I/O methods (set_due_date, reorder) remain untested (pre-existing)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "set_labels skips labels already in the requested state; move_task no-ops if already there; update_task no-ops when nothing differs; close_task is safe to re-run on a closed card; new_task keeps skipIfTitleExists. Partial failure: new_task can leave a created-but-unplaced card, reported by id; update_task restores the bucket or throws."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "issue",
+      "note": "Follow-up: resolveLabels reads GET /labels once (per_page=100), but the server caps pages at max_items_per_page=50 (measured live 2026-09-26; 38 labels, 1 page). Past 50 labels, a label on page 2+ is reported as unknown. Fails loud, never writes wrongly; inherited from the old resolveLabelId. Fix: paginate /labels. Board reads paginate; 429 Retry-After honoured; endpoints match v2.6 as used by the groom-backlog tooling."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No files or long-lived handles; each fetch has an AbortController timeout cleared in finally; 429 bodies are cancelled before retry."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README examples use a generic model name and example titles; test fixtures use http://vikunja.test and generic labels (an internal host name used as a label was renamed before commit); no IPs or internal hosts in packaged files. Public repo; the pre-push denylist hook passed."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "issue",
+      "note": "Pre-existing, deliberate: 6 schemas use .passthrough() (VikunjaTaskSchema carries Vikunja's full task object). New argument schemas are strict z.object with refinements."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "All 5 resource specs declare lifetime and garbageCollection; no new specs added."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Create (new_task), read (list_recent/audit/due_report), update (update_task/set_labels/move_task/set_due_date), close (close_task). Delete is intentionally absent: cards are closed, never deleted."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "Follow-up: guards (done card, recent edit, done bucket, humanInstructed) are inline in the methods, not labelled swamp pre-flight checks, so they can't be selectively skipped; force/humanInstructed are the explicit overrides."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Every edit method and new_task/set_due_date writes vikunjaTask as task-<id> with the same schema shape; list_recent uses list-<id>; audit/due/reorder use their own specs. No cross-spec collisions within a run. The recent-edit guard depends on task-<id> holding the latest write, which every writer refreshes after its final read."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The guard reads prior state via context.readResource('task-<id>'); no direct dataRepository access."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "model.version 2026.09.26.1 with an upgrades entry (attributes carry over; the new policy field has a default)."
+    }
+  ]
+}
