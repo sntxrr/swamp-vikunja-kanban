@@ -32,7 +32,7 @@ Built as a homelab-native replacement for `@webframp/hermes-kanban-orchestrator`
 
 ### `new_task`
 
-Creates a task in the configured project (or in `projectId` if given) and places it into a named kanban bucket. Optionally attaches an existing label by name (case-insensitive; the label must already exist on the Vikunja instance — this model never creates labels). By default, skips creation if a non-done task with the exact same title already exists in the project (best-effort idempotency; Vikunja has no native idempotency-key concept).
+Creates a task in the configured project (or in `projectId` if given) and places it into a named kanban bucket. Optionally attaches existing labels by title: `label` (one) and/or `labels` (a list), case-insensitive. Every label must already exist on the Vikunja instance (this model never creates labels), and all of them are resolved **before** the task is created, so an unknown label fails with nothing created. By default, skips creation if a non-done task with the exact same title already exists in the project (best-effort idempotency; Vikunja has no native idempotency-key concept).
 
 ```sh
 swamp model method run homelab-backlog new_task \
@@ -49,6 +49,10 @@ swamp model method run homelab-backlog new_task \
   --arg title="Renew domain" \
   --arg projectId=7 \
   --arg bucketName=Backlog
+
+# several labels: pass the arguments as a JSON (or YAML) file
+echo '{"title":"Rotate the B2 key","labels":["backups","tier-B"],"bucketName":"Next","priority":3}' > t.json
+swamp model method run homelab-backlog new_task --input-file t.json
 ```
 
 #### Bucket placement
@@ -131,6 +135,23 @@ swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDat
 
 `POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took **and** that the card is still in the same kanban bucket. Done cards are refused. The result is recorded as a `vikunjaTask` resource.
 
+### Editing existing cards: `update_task`, `set_labels`, `move_task`, `close_task`
+
+```sh
+swamp model method run homelab-backlog update_task --arg taskId=62 --arg priority=4
+swamp model method run homelab-backlog update_task --input-file desc.json   # {"taskId":62,"description":"<p>…</p>"}
+swamp model method run homelab-backlog set_labels  --input-file l.json      # {"taskId":62,"add":["tier-B"],"remove":["tier-C"]}
+swamp model method run homelab-backlog move_task   --arg taskId=62 --arg bucketName=Next
+swamp model method run homelab-backlog close_task  --arg taskId=62 --arg humanInstructed=true
+```
+
+- **`update_task`** changes `title`, `description` and/or `priority`. It reads the full task, writes it back with only those fields changed, re-reads, and asserts every field took. If the write dropped the card out of its bucket, it moves the card back and verifies that too. An empty description is refused.
+- **`set_labels`** attaches (`add`) and detaches (`remove`) labels by title through the label endpoints, so the task body is never rewritten. Every title in either list must exist on the instance, so a typo fails instead of reading as "removed". A title in both lists is refused.
+- **`move_task`** moves a card into a named bucket and reads the placement back from the view. The done bucket is refused. Run it **after** field edits: a full-replace write can drop a card out of its bucket.
+- **`close_task`** sets `done: true`, moves the card into the done bucket, and reads both back. It refuses to run unless `humanInstructed: true`: closing a card is a person's decision. It is safe to re-run on a card that is already closed.
+
+**Guards.** `update_task`, `set_labels` and `move_task` refuse done cards, and cards updated within `policy.recentEditMinutes` (default 60) by anything other than this model. A card counts as this model's own when its `updated` matches the one recorded in its `task-<id>` resource by the model's last write, so a card the model just created or edited can be edited again straight away. Pass `force: true` to override; set the policy to `0` to turn the guard off.
+
 ### Board shape and thresholds
 
 Two global arguments describe the board; every field has a default, so set only what differs.
@@ -147,13 +168,14 @@ globalArguments:
     requiredLinkPrefix: "obsidian://"
     requiredLabelPrefixes: [tier-]
     tieBreak: oldest
+    recentEditMinutes: 60
 ```
 
 `waiting` is the column for cards whose only remaining step is a **date** — a scheduled run to observe, a snapshot-drop window, an expiry. Its due date means "look at it again on this day" (what `due_report` posts); the card is never stale before that day and always stale after it, and a waiting card with no due date is an error. Blocked is for cards, people and decisions, never for time.
 
 ## Resources
 
-- `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`).
+- `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`).
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
 - `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
 - `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `converged`.
@@ -163,6 +185,6 @@ globalArguments:
 
 - Auth: `Authorization: Bearer <token>`.
 - Rate limiting: retries transparently on HTTP 429 (`maxRetries`, default 5), honoring `Retry-After`.
-- `POST /tasks/{id}` is a **full replace** in Vikunja — this model never partially updates a task; it only creates, attaches labels, moves between buckets, and sets positions.
+- `POST /tasks/{id}` is a **full replace** in Vikunja. Every method that writes a task body (`update_task`, `set_due_date`, `close_task`) reads the whole task, merges, writes the whole object back, and re-reads.
 - Bucket moves use `POST /projects/{project}/views/{view}/buckets/{bucket}/tasks` (Vikunja ≥ 0.24 / v2.x).
-- Label resolution: `new_task` calls `GET /labels` to map a label name to its numeric id before attaching it via `PUT /tasks/{id}/labels`. If the label doesn't exist, the task is still created — a warning is logged, not an error.
+- Labels: titles are mapped to ids with `GET /labels`, then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written.
