@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.09.21.2"
+version: "2026.09.26.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -19,7 +19,8 @@ description: |
 
   - **new_task** — Create a task in a Vikunja project (default or per-call
     projectId), placing it in a named bucket (bucketName) and optionally
-    attaching an existing label by name (e.g. Urgent, High, Medium).
+    attaching existing labels by title (label / labels), all resolved
+    before anything is created.
   - **list_recent** — List the most recently created tasks in a project.
   - **audit** — Read-only Definition-of-Ready audit of the whole board:
     empty/short descriptions, missing labels or label groups, unset
@@ -36,6 +37,18 @@ description: |
   - **set_due_date** — Set or clear one card's due date via a full-task
     read-modify-write, refusing done cards and asserting on read-back that
     the date took and the bucket did not change.
+  - **update_task** — Change one card's title, description and/or priority
+    via a full-task read-modify-write, asserting each field on read-back and
+    moving the card back if the write dropped it out of its bucket.
+  - **set_labels** — Attach and detach existing labels on one card by title
+    through the label endpoints, with read-back.
+  - **move_task** — Move one card into a named bucket (never the done
+    bucket) and read the placement back.
+  - **close_task** — Mark one card done and move it into the done bucket;
+    runs only with humanInstructed: true.
+
+  The edit methods refuse done cards and cards someone else updated within
+  policy.recentEditMinutes unless force: true.
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
 paths:
   base: manifest

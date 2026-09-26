@@ -10,7 +10,7 @@
  * This is a homelab-native replacement for @webframp/hermes-kanban-orchestrator:
  * instead of shelling out to `hermes kanban create`, it talks to Vikunja's
  * REST API directly with fetch. It creates tasks in a project (a configured
- * default, overridable per call), can attach an existing label by name, and
+ * default, overridable per call), can attach existing labels by name, and
  * places each new task into a named kanban bucket (default "Backlog") so
  * automation-created tasks land in a backlog column rather than wherever
  * Vikunja's view default points — which, for a view with no default bucket
@@ -20,6 +20,12 @@
  * GET /projects/{id}/views (view_kind == "kanban"); no view id needs to be
  * configured. The bucket is resolved *before* the task is created, so a
  * misspelled bucket name fails fast with nothing created.
+ *
+ * It also edits existing cards (update_task, set_labels, move_task,
+ * close_task) under the rules the board has taught: POST /tasks/{id} is a
+ * full replace, so read, merge and write the whole task; labels use their own
+ * endpoints and never go in the task body; every write is read back and
+ * asserted, because HTTP 200 proves nothing.
  *
  * @module
  */
@@ -121,6 +127,12 @@ const GlobalArgsSchema = z.object({
     ),
     tieBreak: z.enum(["oldest", "newest"]).default("oldest").describe(
       "Within equal priority, whether older or newer cards sort first.",
+    ),
+    recentEditMinutes: z.number().int().min(0).default(60).describe(
+      "Write methods (update_task, set_labels, move_task) refuse a card " +
+        "updated within this many minutes unless the last update was this " +
+        "model's own recorded write, or force: true is passed. It keeps " +
+        "automation from overwriting a card someone is editing. 0 disables.",
     ),
   }).prefault({}).describe(
     "Definition-of-Ready thresholds used by audit and the sort order used " +
@@ -327,6 +339,11 @@ const NewTaskArgsSchema = z.object({
     "Optional task description/body.",
   ),
   label: LabelName.optional(),
+  labels: z.array(z.string().min(1)).optional().describe(
+    "Label titles to attach (case-insensitive), in addition to `label`. " +
+      "Every name is resolved before the task is created, so an unknown " +
+      "label fails with nothing created. Labels must already exist.",
+  ),
   dueDate: z.string().optional().describe(
     "Optional ISO 8601 due date, e.g. 2026-09-20T00:00:00Z.",
   ),
@@ -376,6 +393,77 @@ const SetDueDateArgsSchema = z.object({
   ),
 });
 
+const TaskId = z.number().int().positive().describe("Vikunja task id.");
+
+const Force = z.boolean().default(false).describe(
+  "Write even though the card was updated within policy.recentEditMinutes " +
+    "by something other than this model.",
+);
+
+const BoardProject = ProjectIdOverride.describe(
+  "Project whose kanban view is read for the card's bucket. Defaults to " +
+    "the configured projectId.",
+);
+
+const UpdateTaskArgsSchema = z.object({
+  taskId: TaskId,
+  title: z.string().trim().min(1, "title must not be empty").optional()
+    .describe("New title."),
+  description: z.string().optional().describe(
+    "New description (HTML), replacing the old one. An empty or " +
+      "whitespace-only value is refused.",
+  ),
+  priority: z.number().int().min(0).max(5).optional().describe(
+    "New priority (0=unset .. 5=DO NOW).",
+  ),
+  projectId: BoardProject,
+  force: Force,
+}).refine(
+  (a) =>
+    a.title !== undefined || a.description !== undefined ||
+    a.priority !== undefined,
+  { message: "pass at least one of title, description, priority" },
+);
+
+const SetLabelsArgsSchema = z.object({
+  taskId: TaskId,
+  add: z.array(z.string().min(1)).default([]).describe(
+    "Label titles to attach (case-insensitive). Must already exist.",
+  ),
+  remove: z.array(z.string().min(1)).default([]).describe(
+    "Label titles to detach (case-insensitive). Must exist on the " +
+      "instance, so a typo fails instead of reading as removed.",
+  ),
+  force: Force,
+}).refine((a) => a.add.length + a.remove.length > 0, {
+  message: "pass at least one label in add or remove",
+}).refine(
+  (a) => {
+    const add = new Set(a.add.map((n) => n.toLowerCase()));
+    return !a.remove.some((n) => add.has(n.toLowerCase()));
+  },
+  { message: "a label cannot be in both add and remove" },
+);
+
+const MoveTaskArgsSchema = z.object({
+  taskId: TaskId,
+  bucketName: z.string().min(1).describe(
+    "Bucket title (case-insensitive) to move the card into. The done " +
+      "bucket is refused; use close_task.",
+  ),
+  projectId: BoardProject,
+  force: Force,
+});
+
+const CloseTaskArgsSchema = z.object({
+  taskId: TaskId,
+  humanInstructed: z.boolean().default(false).describe(
+    "Must be true. Closing a card is a person's decision, so a caller has " +
+      "to state that a person asked for it.",
+  ),
+  projectId: BoardProject,
+});
+
 const ReorderArgsSchema = z.object({
   projectId: ProjectIdOverride,
   apply: z.boolean().default(false).describe(
@@ -415,6 +503,9 @@ interface ExecCtx {
     instanceName: string,
     payload: unknown,
   ) => Promise<unknown>;
+  readResource?: (
+    instanceName: string,
+  ) => Promise<Record<string, unknown> | null>;
   logger?: {
     info: (msg: string, props?: Record<string, unknown>) => void;
     warning: (msg: string, props?: Record<string, unknown>) => void;
@@ -462,7 +553,7 @@ export function backoffMs(res: Response): number {
  */
 async function vreq(
   g: GlobalArgs,
-  method: "GET" | "PUT" | "POST",
+  method: "GET" | "PUT" | "POST" | "DELETE",
   path: string,
   opts?: { search?: Record<string, string>; body?: unknown },
 ): Promise<unknown> {
@@ -518,19 +609,62 @@ function asArray(json: unknown): Array<Record<string, unknown>> {
   return [];
 }
 
-/** Resolve a label name to its Vikunja label id via GET /labels. */
-async function resolveLabelId(
+interface LabelRef {
+  id: number;
+  title: string;
+}
+
+/**
+ * Resolve label titles (case-insensitive) to their ids via GET /labels,
+ * de-duplicated. Throws naming every unknown title and listing the known
+ * ones. This model never creates labels.
+ */
+async function resolveLabels(
   g: GlobalArgs,
-  labelName: string,
-): Promise<number | null> {
-  const labels = asArray(
-    await vreq(g, "GET", "/labels", { search: { per_page: "100" } }),
+  names: string[],
+): Promise<LabelRef[]> {
+  if (names.length === 0) return [];
+  const known = new Map<string, LabelRef>();
+  for (
+    const l of asArray(
+      await vreq(g, "GET", "/labels", { search: { per_page: "100" } }),
+    )
+  ) {
+    if (typeof l.id === "number" && typeof l.title === "string") {
+      known.set(l.title.toLowerCase(), { id: l.id, title: l.title });
+    }
+  }
+  const out: LabelRef[] = [];
+  const unknown: string[] = [];
+  for (const name of names) {
+    const hit = known.get(name.toLowerCase());
+    if (!hit) unknown.push(name);
+    else if (!out.some((l) => l.id === hit.id)) out.push(hit);
+  }
+  if (unknown.length) {
+    throw new Error(
+      `Label(s) not found on this Vikunja instance: ${unknown.join(", ")} ` +
+        `(labels are never created here); known: ` +
+        [...known.values()].map((l) => l.title).sort().join(", "),
+    );
+  }
+  return out;
+}
+
+/** Lower-cased titles of the labels on a raw task. */
+function labelTitlesOf(raw: Record<string, unknown>): Set<string> {
+  return new Set(
+    asArray(raw.labels).map((l) => l.title).filter((t): t is string =>
+      typeof t === "string"
+    ).map((t) => t.toLowerCase()),
   );
-  const match = labels.find((l) =>
-    typeof l.title === "string" &&
-    l.title.toLowerCase() === labelName.toLowerCase()
-  );
-  return match && typeof match.id === "number" ? match.id : null;
+}
+
+async function readTask(
+  g: GlobalArgs,
+  taskId: number,
+): Promise<Record<string, unknown>> {
+  return await vreq(g, "GET", `/tasks/${taskId}`) as Record<string, unknown>;
 }
 
 /**
@@ -667,6 +801,11 @@ async function newTask(
       target = { viewId, bucketId: bucket.id, bucketTitle: bucket.title };
     }
   }
+  // Labels too: a typo must not leave a half-labelled task behind.
+  const labels = await resolveLabels(g, [
+    ...(args.label ? [args.label] : []),
+    ...(args.labels ?? []),
+  ]);
 
   const body: Record<string, unknown> = { title: args.title };
   if (args.description) body.description = args.description;
@@ -687,28 +826,20 @@ async function newTask(
     );
   }
 
-  if (args.label) {
-    const labelId = await resolveLabelId(g, args.label);
-    if (labelId === null) {
-      ctx.logger?.warning(
-        "Requested label not found on this Vikunja instance \u2014 task created without it",
-        { label: args.label, taskId },
+  for (const label of labels) {
+    try {
+      await vreq(g, "PUT", `/tasks/${taskId}/labels`, {
+        body: { label_id: label.id },
+      });
+    } catch (e) {
+      throw new Error(
+        `Task ${taskId} was created but label "${label.title}" could not be ` +
+          `attached: ` + (e instanceof Error ? e.message : String(e)),
       );
-    } else {
-      try {
-        await vreq(g, "PUT", `/tasks/${taskId}/labels`, {
-          body: { label_id: labelId },
-        });
-      } catch (e) {
-        ctx.logger?.warning("Failed to attach label to task", {
-          taskId,
-          label: args.label,
-          error: e instanceof Error ? e.message : String(e),
-        });
-      }
     }
   }
 
+  // Bucket move LAST: a later full-replace task write can un-bucket a card.
   if (target) {
     try {
       await moveTaskToBucket(
@@ -734,10 +865,17 @@ async function newTask(
     );
   }
 
-  const final = await vreq(g, "GET", `/tasks/${taskId}`) as Record<
-    string,
-    unknown
-  >;
+  const final = await readTask(g, taskId);
+  const have = labelTitlesOf(final);
+  const missing = labels.filter((l) => !have.has(l.title.toLowerCase()));
+  if (missing.length) {
+    throw new Error(
+      `Task ${taskId} was created but label(s) ` +
+        `${
+          missing.map((l) => l.title).join(", ")
+        } are not on it after the write.`,
+    );
+  }
 
   const handle = await ctx.writeResource(
     "vikunjaTask",
@@ -1489,6 +1627,305 @@ async function setDueDate(
   return { dataHandles: [handle] };
 }
 
+/**
+ * Refuse to write to a done card, or to one updated within
+ * policy.recentEditMinutes by anything other than this model. "This model"
+ * means the card's `updated` equals the one recorded in its `task-<id>`
+ * resource by our last write, so a card this model just created or edited
+ * can be edited again straight away.
+ */
+async function guardWrite(
+  g: GlobalArgs,
+  ctx: ExecCtx,
+  task: Record<string, unknown>,
+  force: boolean,
+): Promise<void> {
+  const id = task.id;
+  if (task.done === true) {
+    throw new Error(`Task ${id} is done; not touching a done card.`);
+  }
+  const minutes = g.policy.recentEditMinutes;
+  if (force || minutes === 0 || typeof task.updated !== "string") return;
+  const age = Date.now() - Date.parse(task.updated);
+  if (!Number.isFinite(age) || age >= minutes * 60_000) return;
+  const ours = await ctx.readResource?.(`task-${id}`).catch(() => null);
+  if (ours && ours.updated === task.updated) return;
+  throw new Error(
+    `Task ${id} was updated ${task.updated} (less than ${minutes} min ago) ` +
+      `by something other than this model; someone may be editing it. ` +
+      `Pass force: true to write anyway.`,
+  );
+}
+
+/** Where a card sits now; throws when it is not on the view at all. */
+async function requireBucketOf(
+  g: GlobalArgs,
+  projectId: number,
+  viewId: number,
+  taskId: number,
+): Promise<string> {
+  const bucket = await bucketTitleOf(g, projectId, viewId, taskId);
+  if (bucket === null) {
+    throw new Error(
+      `Task ${taskId} is not on project ${projectId}'s kanban view.`,
+    );
+  }
+  return bucket;
+}
+
+/**
+ * Change a card's title, description and/or priority. POST /tasks/{id} is a
+ * FULL REPLACE, so this reads the whole task, changes only the requested
+ * fields, writes it back, re-reads, and asserts every field took. A
+ * full-replace write can drop the card out of its bucket; if the bucket
+ * changed, the card is moved back and that is verified too.
+ */
+async function updateTask(
+  args: z.infer<typeof UpdateTaskArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  if (args.description !== undefined && textLength(args.description) === 0) {
+    throw new Error("Refusing to write an empty description.");
+  }
+
+  const viewId = await requireKanbanView(g, projectId);
+  const bucketBefore = await requireBucketOf(g, projectId, viewId, args.taskId);
+  const full = await readTask(g, args.taskId);
+  await guardWrite(g, ctx, full, args.force);
+
+  const wanted: Record<string, unknown> = {};
+  if (args.title !== undefined) wanted.title = args.title;
+  if (args.description !== undefined) wanted.description = args.description;
+  if (args.priority !== undefined) wanted.priority = args.priority;
+  const changed = Object.keys(wanted).filter((k) => full[k] !== wanted[k]);
+
+  if (changed.length === 0) {
+    ctx.logger?.info(`Task ${args.taskId}: no change`);
+  } else {
+    await vreq(g, "POST", `/tasks/${args.taskId}`, {
+      body: { ...full, ...wanted },
+    });
+  }
+
+  const after = await readTask(g, args.taskId);
+  const wrong = Object.keys(wanted).filter((k) => after[k] !== wanted[k]);
+  if (wrong.length) {
+    throw new Error(
+      `Task ${args.taskId}: ${wrong.join(", ")} did not read back as sent.`,
+    );
+  }
+  const bucketAfter = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  if (bucketAfter !== bucketBefore) {
+    const back = await resolveBucket(g, projectId, viewId, bucketBefore);
+    await moveTaskToBucket(g, projectId, viewId, back.id, args.taskId);
+    const restored = await bucketTitleOf(g, projectId, viewId, args.taskId);
+    if (restored !== bucketBefore) {
+      throw new Error(
+        `Task ${args.taskId}: fields are set, but the write moved the card ` +
+          `from "${bucketBefore}" to "${bucketAfter}" and moving it back ` +
+          `left it in "${restored}".`,
+      );
+    }
+    ctx.logger?.warning(
+      `Task ${args.taskId}: the write moved the card out of ` +
+        `"${bucketBefore}"; moved it back`,
+    );
+  }
+
+  const final = await readTask(g, args.taskId);
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `task-${args.taskId}`,
+    toVikunjaTask(final, fetchedAt),
+  );
+  ctx.logger?.info(
+    `Task ${args.taskId}: updated ${changed.join(", ") || "nothing"}`,
+    {
+      bucket: bucketBefore,
+    },
+  );
+  return { dataHandles: [handle] };
+}
+
+/**
+ * Attach and detach existing labels by title. Labels have their own
+ * endpoints (PUT/DELETE /tasks/{id}/labels), so the task body is never
+ * rewritten. Every name is resolved before anything changes, and the
+ * result is read back.
+ */
+async function setLabels(
+  args: z.infer<typeof SetLabelsArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const add = await resolveLabels(g, args.add);
+  const remove = await resolveLabels(g, args.remove);
+
+  const task = await readTask(g, args.taskId);
+  await guardWrite(g, ctx, task, args.force);
+  const have = labelTitlesOf(task);
+
+  for (const l of add) {
+    if (have.has(l.title.toLowerCase())) continue;
+    await vreq(g, "PUT", `/tasks/${args.taskId}/labels`, {
+      body: { label_id: l.id },
+    });
+  }
+  for (const l of remove) {
+    if (!have.has(l.title.toLowerCase())) continue;
+    await vreq(g, "DELETE", `/tasks/${args.taskId}/labels/${l.id}`);
+  }
+
+  const after = await readTask(g, args.taskId);
+  const now = labelTitlesOf(after);
+  const missing = add.filter((l) => !now.has(l.title.toLowerCase()));
+  const lingering = remove.filter((l) => now.has(l.title.toLowerCase()));
+  if (missing.length || lingering.length) {
+    throw new Error(
+      `Task ${args.taskId}: labels did not read back as intended` +
+        (missing.length
+          ? `; still missing ${missing.map((l) => l.title).join(", ")}`
+          : "") +
+        (lingering.length
+          ? `; still attached ${lingering.map((l) => l.title).join(", ")}`
+          : ""),
+    );
+  }
+
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `task-${args.taskId}`,
+    toVikunjaTask(after, fetchedAt),
+  );
+  ctx.logger?.info(
+    `Task ${args.taskId}: labels = ${[...now].sort().join(", ")}`,
+  );
+  return { dataHandles: [handle] };
+}
+
+/**
+ * Move a card into a named bucket and read the placement back from the
+ * view. The done bucket is refused: closing is close_task's job, and it
+ * needs a person's instruction.
+ */
+async function moveTask(
+  args: z.infer<typeof MoveTaskArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const target = await resolveBucket(g, projectId, viewId, args.bucketName);
+  if (roleOf(target.title, g.bucketRoles) === "done") {
+    throw new Error(
+      `Refusing to move task ${args.taskId} into "${target.title}": use ` +
+        `close_task, which needs humanInstructed: true.`,
+    );
+  }
+
+  const task = await readTask(g, args.taskId);
+  await guardWrite(g, ctx, task, args.force);
+  const from = await requireBucketOf(g, projectId, viewId, args.taskId);
+  if (from.toLowerCase() === target.title.toLowerCase()) {
+    ctx.logger?.info(`Task ${args.taskId}: already in "${from}"`);
+  } else {
+    await moveTaskToBucket(g, projectId, viewId, target.id, args.taskId);
+    const now = await bucketTitleOf(g, projectId, viewId, args.taskId);
+    if (now !== target.title) {
+      throw new Error(
+        `Task ${args.taskId}: still in "${now}" after moving it to ` +
+          `"${target.title}".`,
+      );
+    }
+    ctx.logger?.info(`Task ${args.taskId}: "${from}" -> "${target.title}"`);
+  }
+
+  const final = await readTask(g, args.taskId);
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `task-${args.taskId}`,
+    toVikunjaTask({
+      ...final,
+      placement: { viewId, bucketId: target.id, bucketTitle: target.title },
+    }, fetchedAt),
+  );
+  return { dataHandles: [handle] };
+}
+
+/**
+ * Close a card: done=true through a full-replace write, then into the done
+ * bucket, both read back. Only runs with humanInstructed: true. It skips
+ * the recent-edit guard: the person who asked for it is the editor.
+ */
+async function closeTask(
+  args: z.infer<typeof CloseTaskArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  if (!args.humanInstructed) {
+    throw new Error(
+      "close_task is never automatic: pass humanInstructed: true when a " +
+        "person asked for this card to be closed.",
+    );
+  }
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const doneBucket = await resolveBucket(
+    g,
+    projectId,
+    viewId,
+    g.bucketRoles.done,
+  );
+
+  const full = await readTask(g, args.taskId);
+  if (full.done === true) {
+    ctx.logger?.info(`Task ${args.taskId}: already done`);
+  } else {
+    await vreq(g, "POST", `/tasks/${args.taskId}`, {
+      body: { ...full, done: true },
+    });
+    const after = await readTask(g, args.taskId);
+    if (after.done !== true) {
+      throw new Error(`Task ${args.taskId}: done did not stick.`);
+    }
+  }
+  if (
+    (await bucketTitleOf(g, projectId, viewId, args.taskId)) !==
+      doneBucket.title
+  ) {
+    await moveTaskToBucket(g, projectId, viewId, doneBucket.id, args.taskId);
+  }
+  const bucket = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  const final = await readTask(g, args.taskId);
+  if (bucket !== doneBucket.title || final.done !== true) {
+    throw new Error(
+      `Task ${args.taskId}: close did not complete (done=${final.done}, ` +
+        `bucket "${bucket}").`,
+    );
+  }
+
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `task-${args.taskId}`,
+    toVikunjaTask({
+      ...final,
+      placement: {
+        viewId,
+        bucketId: doneBucket.id,
+        bucketTitle: doneBucket.title,
+      },
+    }, fetchedAt),
+  );
+  ctx.logger?.info(`Task ${args.taskId}: closed (done, "${doneBucket.title}")`);
+  return { dataHandles: [handle] };
+}
+
 async function reorder(
   args: ReorderArgs,
   ctx: ExecCtx,
@@ -1603,10 +2040,10 @@ async function reorder(
 // Model
 // ============================================================================
 
-/** Vikunja kanban orchestrator: create and list tasks via the Vikunja REST API. */
+/** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.19.2",
+  version: "2026.09.26.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1668,6 +2105,22 @@ export const model = {
         "replace), refusing done cards and asserting on read-back that " +
         "the date took and the card's bucket did not change. Existing " +
         "model attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.26.1",
+      description:
+        "Added update_task (title/description/priority, full-replace " +
+        "read-modify-write, bucket restored if the write drops it), " +
+        "set_labels (attach/detach existing labels by title), move_task " +
+        "(any bucket except done) and close_task (done + done bucket, only " +
+        "with humanInstructed: true); every write is read back. The first " +
+        "three refuse done cards and cards someone else updated within the " +
+        "new policy.recentEditMinutes (default 60) unless force: true. " +
+        "new_task gains labels (array); an unknown label now fails before " +
+        "the task is created instead of being skipped with a warning, and " +
+        "labels missing after the write are an error. Existing model " +
+        "attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1758,11 +2211,52 @@ export const model = {
         "per-call projectId) and place it into a named kanban bucket " +
         '(default "Backlog", override with bucketName) so it lands in a ' +
         "backlog column rather than the view's default working column. " +
-        "Optionally attaches an existing label by name (Urgent/High/Medium) " +
-        "and skips creation if a non-done task with the same title already " +
-        "exists.",
+        "Optionally attaches existing labels by title (label and/or " +
+        "labels; all resolved before anything is created) and skips " +
+        "creation if a non-done task with the same title already exists.",
       arguments: NewTaskArgsSchema,
       execute: newTask,
+    },
+    update_task: {
+      description:
+        "Change one card's title, description and/or priority. Reads the " +
+        "full task, writes it back with only those fields changed " +
+        "(Vikunja's POST /tasks/{id} is a full replace), re-reads and " +
+        "asserts each field took, and moves the card back if the write " +
+        "dropped it out of its bucket. Refuses done cards, empty " +
+        "descriptions, and cards someone else updated within " +
+        "policy.recentEditMinutes unless force: true.",
+      arguments: UpdateTaskArgsSchema,
+      execute: updateTask,
+    },
+    set_labels: {
+      description:
+        "Attach (add) and detach (remove) existing labels on one card by " +
+        "title, case-insensitive. Every title is resolved first, so an " +
+        "unknown one fails with nothing changed; labels are never created. " +
+        "Reads the card back and asserts the result. Same done-card and " +
+        "recent-edit guards as update_task.",
+      arguments: SetLabelsArgsSchema,
+      execute: setLabels,
+    },
+    move_task: {
+      description:
+        "Move one card into a named bucket and read its placement back " +
+        "from the kanban view. Refuses the done bucket (use close_task), " +
+        "done cards, and cards someone else updated within " +
+        "policy.recentEditMinutes unless force: true. Run it after any " +
+        "field edits: a full-replace write can drop a card out of its " +
+        "bucket.",
+      arguments: MoveTaskArgsSchema,
+      execute: moveTask,
+    },
+    close_task: {
+      description:
+        "Close one card: set done=true, move it into the done bucket, and " +
+        "read both back. Only runs with humanInstructed: true, because " +
+        "closing a card is a person's decision.",
+      arguments: CloseTaskArgsSchema,
+      execute: closeTask,
     },
     list_recent: {
       description:
