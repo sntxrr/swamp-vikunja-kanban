@@ -1158,6 +1158,192 @@ function daysBetween(fromIso: string, now: Date): number | null {
   return (now.getTime() - t) / 86_400_000;
 }
 
+// ============================================================================
+// Readiness rules — shared by audit and every write path
+// ============================================================================
+
+/** The fields of a card the Definition-of-Ready rules look at. */
+export interface CardState {
+  title: string;
+  description: string;
+  labels: string[];
+  priority: number;
+  dueDate: string | null;
+}
+
+/**
+ * One Definition-of-Ready check that failed. `weight` is how hard the rule
+ * is outside the ready column: `always` is an error everywhere, `must` an
+ * error in executable columns and a warning elsewhere, `marker` an error in
+ * executable columns and info elsewhere. Writes that enforce readiness treat
+ * every weight as a refusal.
+ */
+export interface DorCheck {
+  rule: string;
+  detail: string;
+  weight: "always" | "must" | "marker";
+}
+
+/**
+ * The Definition-of-Ready content rules, in the order audit reports them:
+ * description length, label groups, priority, then the verdict / acceptance
+ * / source-link markers (only checked when the description has text).
+ *
+ * Marker matching: verdict markers are case-SENSITIVE (a verdict is a
+ * shouted word, and "confirmed" in prose is not one); acceptance markers
+ * are case-INSENSITIVE ("Acceptance:", "acceptance criteria", "verify
+ * with" all count). The source link is a case-sensitive prefix match.
+ */
+export function dorChecks(
+  card: Pick<CardState, "description" | "labels" | "priority">,
+  policy: Policy,
+): DorCheck[] {
+  const out: DorCheck[] = [];
+  const add = (rule: string, weight: DorCheck["weight"], detail: string) =>
+    out.push({ rule, detail, weight });
+
+  const len = textLength(card.description);
+  if (len === 0) add("empty-description", "always", "description is empty");
+  else if (len < policy.minDescriptionChars) {
+    add(
+      "short-description",
+      "must",
+      `${len} chars < ${policy.minDescriptionChars}`,
+    );
+  }
+
+  if (card.labels.length === 0) add("no-labels", "must", "no labels at all");
+  else {
+    for (const prefix of policy.requiredLabelPrefixes) {
+      if (
+        !card.labels.some((l) =>
+          l.toLowerCase().startsWith(prefix.toLowerCase())
+        )
+      ) {
+        add(
+          "missing-label-group",
+          "must",
+          `no label starting with "${prefix}"`,
+        );
+      }
+    }
+    const isGroup = (l: string) =>
+      policy.requiredLabelPrefixes.some((p) =>
+        l.toLowerCase().startsWith(p.toLowerCase())
+      );
+    if (!card.labels.some((l) => !isGroup(l))) {
+      add("missing-area-label", "must", "only group labels, no area label");
+    }
+  }
+
+  if (card.priority < 1 || card.priority > 5) {
+    add(
+      "priority-unset",
+      "must",
+      card.priority === 0
+        ? "priority is 0 (unset)"
+        : `priority ${card.priority} is outside 1-5`,
+    );
+  }
+
+  if (len > 0) {
+    const desc = card.description;
+    if (!policy.verdictMarkers.some((m) => desc.includes(m))) {
+      add(
+        "missing-verdict",
+        "marker",
+        `no premise-check verdict (${policy.verdictMarkers.join("/")})`,
+      );
+    }
+    const lower = desc.toLowerCase();
+    if (
+      !policy.acceptanceMarkers.some((m) => lower.includes(m.toLowerCase()))
+    ) {
+      add(
+        "missing-acceptance",
+        "marker",
+        `no acceptance marker (${policy.acceptanceMarkers.join("/")})`,
+      );
+    }
+    if (
+      policy.requiredLinkPrefix && !desc.includes(policy.requiredLinkPrefix)
+    ) {
+      add(
+        "missing-link",
+        "must",
+        `no ${policy.requiredLinkPrefix} link to the source note`,
+      );
+    }
+  }
+  return out;
+}
+
+/** A reason a write is refused by the readiness rules. */
+export interface ReadinessProblem {
+  rule: string;
+  detail: string;
+}
+
+/**
+ * What a card must satisfy to be created in, or moved into, a bucket of
+ * `role` — the write-side counterpart of audit, built on the same checks:
+ *
+ * - every card: a non-empty title;
+ * - create into doing / review / done: refused (people start and finish
+ *   work); move into done: refused (close_task);
+ * - ready: the full Definition of Ready (dorChecks, every weight) — which
+ *   includes a label matching each requiredLabelPrefixes group, at least
+ *   one label outside them (the area), and priority 1-5;
+ * - waiting: a due date;
+ * - backlog / blocked / other: nothing more, so automation can file stubs.
+ *
+ * `requireReady` applies the full Definition of Ready whatever the role.
+ */
+export function readinessProblems(
+  card: CardState,
+  role: Role,
+  policy: Policy,
+  opts: { intent: "create" | "move"; requireReady?: boolean },
+): ReadinessProblem[] {
+  const out: ReadinessProblem[] = [];
+  if (card.title.trim() === "") {
+    out.push({ rule: "empty-title", detail: "title is empty" });
+  }
+  const refused = opts.intent === "create"
+    ? role === "doing" || role === "review" || role === "done"
+    : role === "done";
+  if (refused) {
+    out.push({
+      rule: "refused-bucket",
+      detail: opts.intent === "create"
+        ? `new cards are never created in the ${role} column`
+        : "moving into the done column is close_task's job",
+    });
+  }
+  if (role === "ready" || opts.requireReady) {
+    for (const c of dorChecks(card, policy)) {
+      out.push({ rule: c.rule, detail: c.detail });
+    }
+  }
+  if (role === "waiting" && card.dueDate === null) {
+    out.push({
+      rule: "missing-due-date",
+      detail: "a waiting card needs a due date — the day to look at it again",
+    });
+  }
+  return out;
+}
+
+/** One line per problem, for error messages. */
+export function formatProblems(ps: ReadinessProblem[]): string {
+  return ps.map((p) => `${p.rule} (${p.detail})`).join("; ");
+}
+
+/** Title comparison used for duplicate detection: trimmed, case-insensitive. */
+export function sameTitle(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
 /**
  * Findings for one card, scoped by the role of the bucket it sits in. The
  * full Definition of Ready is only *required* (error) in the ready column
@@ -1218,66 +1404,20 @@ export function auditCard(
     }
   }
 
-  const len = textLength(task.description);
-  if (len === 0) add("empty-description", "error", "description is empty");
-  else if (len < policy.minDescriptionChars) {
+  // The content rules are shared with the write paths (readinessProblems);
+  // only the severity depends on where the card sits.
+  for (const c of dorChecks(task, policy)) {
     add(
-      "short-description",
-      must,
-      `${len} chars < ${policy.minDescriptionChars}`,
+      c.rule,
+      c.weight === "always"
+        ? "error"
+        : c.weight === "must"
+        ? must
+        : executable
+        ? "error"
+        : "info",
+      c.detail,
     );
-  }
-
-  if (task.labels.length === 0) add("no-labels", must, "no labels at all");
-  else {
-    for (const prefix of policy.requiredLabelPrefixes) {
-      if (
-        !task.labels.some((l) =>
-          l.toLowerCase().startsWith(prefix.toLowerCase())
-        )
-      ) {
-        add("missing-label-group", must, `no label starting with "${prefix}"`);
-      }
-    }
-    const isGroup = (l: string) =>
-      policy.requiredLabelPrefixes.some((p) =>
-        l.toLowerCase().startsWith(p.toLowerCase())
-      );
-    if (!task.labels.some((l) => !isGroup(l))) {
-      add("missing-area-label", must, "only group labels, no area label");
-    }
-  }
-
-  if (task.priority === 0) add("priority-unset", must, "priority is 0 (unset)");
-
-  if (len > 0) {
-    const desc = task.description;
-    if (!policy.verdictMarkers.some((m) => desc.includes(m))) {
-      add(
-        "missing-verdict",
-        executable ? "error" : "info",
-        `no premise-check verdict (${policy.verdictMarkers.join("/")})`,
-      );
-    }
-    const lower = desc.toLowerCase();
-    if (
-      !policy.acceptanceMarkers.some((m) => lower.includes(m.toLowerCase()))
-    ) {
-      add(
-        "missing-acceptance",
-        executable ? "error" : "info",
-        `no acceptance marker (${policy.acceptanceMarkers.join("/")})`,
-      );
-    }
-    if (
-      policy.requiredLinkPrefix && !desc.includes(policy.requiredLinkPrefix)
-    ) {
-      add(
-        "missing-link",
-        must,
-        `no ${policy.requiredLinkPrefix} link to the source note`,
-      );
-    }
   }
 
   const staleAfter =
