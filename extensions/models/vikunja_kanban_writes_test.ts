@@ -40,6 +40,7 @@ class FakeVikunja {
     { id: 11, title: "Next", position: 2 },
     { id: 12, title: "Doing", position: 3 },
     { id: 13, title: "Done", position: 4 },
+    { id: 14, title: "Waiting", position: 5 },
   ];
   doneBucket = 13;
   tasks = new Map<number, Task>();
@@ -50,6 +51,8 @@ class FakeVikunja {
   unbucketOnWrite = false;
   /** Fields a POST /tasks/{id} silently ignores (a write that "succeeds"). */
   ignoreOnWrite: string[] = [];
+  /** Fields a PUT /projects/{id}/tasks (create) silently drops. */
+  dropOnCreate: string[] = [];
   writes: string[] = [];
 
   seed(over: Partial<Task> & { bucket?: number; labelIds?: number[] } = {}) {
@@ -134,7 +137,9 @@ class FakeVikunja {
       return [200, {}];
     }
     if (method === "PUT" && path === "/projects/5/tasks") {
-      const id = this.seed(body as Partial<Task>);
+      const fields = { ...(body as Partial<Task>) };
+      for (const f of this.dropOnCreate) delete fields[f];
+      const id = this.seed(fields);
       this.touch(id);
       return [201, this.view(id)];
     }
@@ -234,6 +239,14 @@ async function withFake<T>(
   }
 }
 
+/** A body that passes the full Definition of Ready. */
+const READY_BODY =
+  "<p><strong>Verdict (2026-09-27): CONFIRMED</strong> — the " +
+  "example check printed the expected value.</p><p><strong>Acceptance:" +
+  "</strong> <code>example-cli status</code> prints <code>ok</code>.</p>" +
+  '<p>Source: <a href="obsidian://open?vault=example&file=note">note</a></p>' +
+  "<p>" + "Context that makes the card executable. ".repeat(10) + "</p>";
+
 const bucketTitle = (f: FakeVikunja, id: number) =>
   f.buckets.find((b) => b.id === f.bucketOf.get(id))!.title;
 const labelTitles = (f: FakeVikunja, id: number) =>
@@ -250,6 +263,8 @@ Deno.test("new_task attaches label + labels, then moves LAST", async () => {
       label: "automation",
       labels: ["TIER-B", "automation"],
       bucketName: "Next",
+      description: READY_BODY,
+      priority: 3,
     });
   });
   const id = 100;
@@ -337,6 +352,149 @@ Deno.test("skipIfTitleExists finds a duplicate beyond the first page", async () 
   });
   assertEquals(f.writes, []);
   assertStrictEquals(f.tasks.size, 61);
+});
+
+Deno.test("new_task refuses a stub into Next, or anywhere with requireReady", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () =>
+        run("new_task", {
+          title: "stub",
+          description: "<p>todo</p>",
+          labels: ["automation", "tier-B"],
+          priority: 3,
+          bucketName: "Next",
+        }),
+      Error,
+      "short-description",
+    );
+    await assertRejects(
+      () => run("new_task", { title: "stub", requireReady: true }),
+      Error,
+      "empty-description",
+    );
+  });
+  assertEquals(f.writes, []);
+  // Negative control: the same stub in Backlog is still accepted, so
+  // automated creators that file stubs keep working.
+  await withFake(f, (run) => run("new_task", { title: "stub" }));
+  assertStrictEquals(bucketTitle(f, 100), "Backlog");
+});
+
+Deno.test("new_task into Next needs a tier label and an area label", async () => {
+  const f = new FakeVikunja();
+  const card = { description: READY_BODY, priority: 3, bucketName: "Next" };
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () => run("new_task", { ...card, title: "a", labels: ["automation"] }),
+      Error,
+      "missing-label-group",
+    );
+    await assertRejects(
+      () => run("new_task", { ...card, title: "b", labels: ["tier-B"] }),
+      Error,
+      "missing-area-label",
+    );
+  });
+  assertEquals(f.writes, []);
+  await withFake(
+    f,
+    (run) =>
+      run("new_task", {
+        ...card,
+        title: "c",
+        labels: ["automation", "tier-B"],
+      }),
+  );
+  assertStrictEquals(bucketTitle(f, 100), "Next");
+});
+
+Deno.test("new_task into Waiting needs a due date; into Doing is refused", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () => run("new_task", { title: "w", bucketName: "Waiting" }),
+      Error,
+      "missing-due-date",
+    );
+    await assertRejects(
+      () => run("new_task", { title: "d", bucketName: "doing" }),
+      Error,
+      "refused-bucket",
+    );
+    assertEquals(f.writes, []);
+    await run("new_task", {
+      title: "w",
+      bucketName: "Waiting",
+      dueDate: "2026-11-04T17:00:00Z",
+    });
+  });
+  assertStrictEquals(bucketTitle(f, 100), "Waiting");
+  assertStrictEquals(f.tasks.get(100)!.due_date, "2026-11-04T17:00:00Z");
+});
+
+Deno.test("new_task sets a due date the create dropped, then reads it back", async () => {
+  const f = new FakeVikunja();
+  f.dropOnCreate = ["due_date", "priority"];
+  await withFake(f, (run) =>
+    run("new_task", {
+      title: "dated",
+      priority: 4,
+      dueDate: "2026-11-04T17:00:00Z",
+    }));
+  const t = f.tasks.get(100)!;
+  assertStrictEquals(t.due_date, "2026-11-04T17:00:00Z");
+  assertStrictEquals(t.priority, 4);
+  assert(f.writes.includes("POST /tasks/100"), f.writes.join("\n"));
+});
+
+Deno.test("new_task read-back mismatch throws naming the task id", async () => {
+  const f = new FakeVikunja();
+  f.dropOnCreate = ["description"];
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () => run("new_task", { title: "x", description: "<p>mine</p>" }),
+      Error,
+      "Task 100 was created but did not read back as sent: description",
+    );
+    // Recorded anyway, so a fix-up edit passes the recent-edit guard.
+    assert(store.has("task-100"));
+  });
+});
+
+Deno.test("duplicateTitle: refuse and skip match case-insensitively; allow creates", async () => {
+  const f = new FakeVikunja();
+  const dup = f.seed({ title: "Rotate The Example Key" });
+  f.seed({ title: "rotate the example key", done: true, bucket: 13 });
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () =>
+        run("new_task", {
+          title: " rotate the example KEY ",
+          duplicateTitle: "refuse",
+        }),
+      Error,
+      `open task ${dup} already has that title`,
+    );
+    // Default (and the deprecated skipIfTitleExists: true) = skip.
+    await run("new_task", { title: "ROTATE the example key" });
+    await run("new_task", {
+      title: "rotate the example key",
+      skipIfTitleExists: true,
+    });
+    assert(store.has(`task-${dup}`));
+    assertEquals(f.writes, []);
+    await run("new_task", {
+      title: "rotate the example key",
+      duplicateTitle: "allow",
+    });
+    await run("new_task", {
+      title: "Rotate the example key",
+      skipIfTitleExists: false,
+    });
+  });
+  assertStrictEquals(f.tasks.size, 4);
 });
 
 // ------------------------------------------------------------- update_task

@@ -357,10 +357,22 @@ const NewTaskArgsSchema = z.object({
       "so an unknown name fails with nothing created. Empty string " +
       "disables placement for this call.",
   ),
-  skipIfTitleExists: z.boolean().default(true).describe(
-    "If true (default), checks for a non-done task with the exact same " +
-      "title in the project first and skips creation (idempotency without " +
-      "a dedicated dedup key — Vikunja has no idempotency-key concept).",
+  duplicateTitle: z.enum(["refuse", "skip", "allow"]).optional().describe(
+    "What to do when a non-done task in the project already has this title " +
+      "(trimmed, case-insensitive): refuse = fail with nothing created; " +
+      "skip = create nothing and record the existing task as the result " +
+      "(idempotency — Vikunja has no idempotency key); allow = create " +
+      "anyway. Default: skip, or allow when skipIfTitleExists is false.",
+  ),
+  skipIfTitleExists: z.boolean().optional().describe(
+    "Deprecated alias kept for existing callers: true (the old default) = " +
+      'duplicateTitle "skip", false = "allow". duplicateTitle wins when ' +
+      "both are given.",
+  ),
+  requireReady: z.boolean().default(false).describe(
+    "Apply the full Definition of Ready (as audit checks it in the ready " +
+      "column) whatever the target bucket. Creating into the ready bucket " +
+      "always applies it.",
   ),
 });
 type NewTaskArgs = z.infer<typeof NewTaskArgsSchema>;
@@ -808,29 +820,7 @@ async function newTask(
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = new Date().toISOString();
   const projectId = args.projectId ?? g.projectId;
-
-  if (args.skipIfTitleExists) {
-    const existing = await fetchAllPages(g, `/projects/${projectId}/tasks`, {
-      s: args.title,
-    });
-    const dup = existing.find((t) =>
-      typeof t.title === "string" &&
-      t.title === args.title &&
-      t.done !== true
-    );
-    if (dup && typeof dup.id === "number") {
-      ctx.logger?.info(
-        "Task with matching title already exists \u2014 skipping create",
-        { title: args.title, existingId: dup.id, projectId },
-      );
-      const handle = await ctx.writeResource(
-        "vikunjaTask",
-        `task-${dup.id}`,
-        toVikunjaTask(dup, fetchedAt),
-      );
-      return { dataHandles: [handle] };
-    }
-  }
+  const duplicates = duplicateModeOf(args);
 
   // Resolve the destination bucket up front: an unknown bucket name must
   // fail here, before anything is created, rather than leave a task sitting
@@ -838,8 +828,10 @@ async function newTask(
   const bucketName = args.bucketName ?? g.defaultBucketName;
   let target: { viewId: number; bucketId: number; bucketTitle: string } | null =
     null;
+  const viewId = bucketName || duplicates !== "allow"
+    ? await resolveKanbanViewId(g, projectId)
+    : null;
   if (bucketName) {
-    const viewId = await resolveKanbanViewId(g, projectId);
     if (viewId === null) {
       ctx.logger?.warning(
         "Project has no kanban view \u2014 skipping bucket placement",
@@ -859,9 +851,62 @@ async function newTask(
     ? resolveLabels(await fetchAllLabels(g), labelNames)
     : [];
 
+  // Readiness, keyed by the destination bucket's role. With placement
+  // disabled there is no role, so only the title is required (unless
+  // requireReady).
+  const wantedDue = args.dueDate?.trim() ? args.dueDate.trim() : null;
+  if (wantedDue !== null && !Number.isFinite(Date.parse(wantedDue))) {
+    throw new Error(`dueDate is not a parseable instant: ${args.dueDate}`);
+  }
+  const role: Role = target
+    ? roleOf(target.bucketTitle, g.bucketRoles)
+    : "other";
+  const problems = readinessProblems(
+    {
+      title: args.title,
+      description: args.description ?? "",
+      labels: labels.map((l) => l.title),
+      priority: args.priority ?? 0,
+      dueDate: wantedDue,
+    },
+    role,
+    g.policy,
+    { intent: "create", requireReady: args.requireReady },
+  );
+  if (problems.length) {
+    throw new Error(
+      `Refusing to create "${args.title}" in ` +
+        `"${target?.bucketTitle ?? "(no bucket)"}": ` +
+        `${formatProblems(problems)}. Nothing was created.`,
+    );
+  }
+
+  if (duplicates !== "allow") {
+    const dup = await findOpenTitle(g, projectId, viewId, args.title);
+    if (dup !== null) {
+      if (duplicates === "refuse") {
+        throw new Error(
+          `Refusing to create "${args.title}": open task ${dup} already has ` +
+            `that title (case-insensitive). Nothing was created; pass ` +
+            `duplicateTitle: "allow" to create it anyway.`,
+        );
+      }
+      ctx.logger?.info(
+        "Task with matching title already exists \u2014 skipping create",
+        { title: args.title, existingId: dup, projectId },
+      );
+      const handle = await ctx.writeResource(
+        "vikunjaTask",
+        `task-${dup}`,
+        toVikunjaTask(await readTask(g, dup), fetchedAt),
+      );
+      return { dataHandles: [handle] };
+    }
+  }
+
   const body: Record<string, unknown> = { title: args.title };
   if (args.description) body.description = args.description;
-  if (args.dueDate) body.due_date = args.dueDate;
+  if (wantedDue !== null) body.due_date = wantedDue;
   if (args.priority !== undefined) body.priority = args.priority;
 
   const created = await vreq(
@@ -876,6 +921,22 @@ async function newTask(
     throw new Error(
       `Vikunja task creation for "${args.title}" returned no numeric id.`,
     );
+  }
+
+  // A create can ignore due_date (and priority): fix them with a
+  // full-replace write now, before labels and the bucket move.
+  const fresh = await readTask(g, taskId);
+  const fix: Record<string, unknown> = {};
+  if (args.priority !== undefined && fresh.priority !== args.priority) {
+    fix.priority = args.priority;
+  }
+  if (
+    wantedDue !== null && !sameInstant(dueDateOf(fresh.due_date), wantedDue)
+  ) {
+    fix.due_date = wantedDue;
+  }
+  if (Object.keys(fix).length) {
+    await vreq(g, "POST", `/tasks/${taskId}`, { body: { ...fresh, ...fix } });
   }
 
   for (const label of labels) {
@@ -917,18 +978,25 @@ async function newTask(
     );
   }
 
+  // Full read-back: HTTP 200 proves nothing.
   const final = await readTask(g, taskId);
-  const have = labelTitlesOf(final);
-  const missing = labels.filter((l) => !have.has(l.title.toLowerCase()));
-  if (missing.length) {
-    throw new Error(
-      `Task ${taskId} was created but label(s) ` +
-        `${
-          missing.map((l) => l.title).join(", ")
-        } are not on it after the write.`,
-    );
+  const errors = createReadBackErrors(final, {
+    title: args.title,
+    description: args.description || undefined,
+    priority: args.priority,
+    dueDate: wantedDue,
+    labels: labels.map((l) => l.title),
+  });
+  if (target) {
+    const bucket = await bucketTitleOf(g, projectId, target.viewId, taskId);
+    if (bucket !== target.bucketTitle) {
+      errors.push(
+        `bucket read back as "${bucket}", not "${target.bucketTitle}"`,
+      );
+    }
   }
 
+  // Record it even on a mismatch, so a follow-up edit is recognised as ours.
   const handle = await ctx.writeResource(
     "vikunjaTask",
     `task-${taskId}`,
@@ -937,12 +1005,101 @@ async function newTask(
       fetchedAt,
     ),
   );
+  if (errors.length) {
+    throw new Error(
+      `Task ${taskId} was created but did not read back as sent: ` +
+        `${errors.join("; ")}.`,
+    );
+  }
   ctx.logger?.info(`Vikunja task created: ${taskId}`, {
     title: args.title,
     projectId,
     bucket: target?.bucketTitle ?? null,
   });
   return { dataHandles: [handle] };
+}
+
+/** new_task's duplicate policy, honouring the deprecated skipIfTitleExists. */
+function duplicateModeOf(
+  args: Pick<NewTaskArgs, "duplicateTitle" | "skipIfTitleExists">,
+): "refuse" | "skip" | "allow" {
+  if (args.duplicateTitle) return args.duplicateTitle;
+  return args.skipIfTitleExists === false ? "allow" : "skip";
+}
+
+/** Both unset, or the same instant however it is written. */
+function sameInstant(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === b;
+  return Date.parse(a) === Date.parse(b);
+}
+
+/**
+ * The id of a not-done task in the project whose title matches (trimmed,
+ * case-insensitive), or null. Reads the kanban board when there is one —
+ * every task sits in a bucket, and the match cannot depend on how the
+ * server's `s` search treats case — else the paged title search.
+ */
+async function findOpenTitle(
+  g: GlobalArgs,
+  projectId: number,
+  viewId: number | null,
+  title: string,
+): Promise<number | null> {
+  const open: Array<{ id: number; title: string }> = [];
+  if (viewId !== null) {
+    for (const b of await fetchBoard(g, projectId, viewId)) {
+      if (roleOf(b.title, g.bucketRoles) === "done") continue;
+      open.push(...b.tasks.filter((t) => !t.done));
+    }
+  } else {
+    for (
+      const t of await fetchAllPages(g, `/projects/${projectId}/tasks`, {
+        s: title.trim(),
+      })
+    ) {
+      if (
+        typeof t.id === "number" && typeof t.title === "string" &&
+        t.done !== true
+      ) open.push({ id: t.id, title: t.title });
+    }
+  }
+  return open.find((t) => sameTitle(t.title, title))?.id ?? null;
+}
+
+/**
+ * Compare a created task, as read back, with what was asked for. Fields
+ * that were not given are not checked. Returns one line per mismatch.
+ */
+export function createReadBackErrors(
+  got: Record<string, unknown>,
+  want: {
+    title: string;
+    description?: string;
+    priority?: number;
+    dueDate: string | null;
+    labels: string[];
+  },
+): string[] {
+  const errors: string[] = [];
+  if (got.title !== want.title) {
+    errors.push(`title read back as ${JSON.stringify(got.title)}`);
+  }
+  if (want.description !== undefined && got.description !== want.description) {
+    const len = typeof got.description === "string"
+      ? textLength(got.description)
+      : 0;
+    errors.push(`description read back differs (${len} visible chars)`);
+  }
+  if (want.priority !== undefined && got.priority !== want.priority) {
+    errors.push(`priority read back as ${got.priority}`);
+  }
+  if (!sameInstant(dueDateOf(got.due_date), want.dueDate)) {
+    errors.push(`due date read back as ${dueDateOf(got.due_date)}`);
+  }
+  const have = labelTitlesOf(got);
+  const missing = want.labels.filter((l) => !have.has(l.toLowerCase()));
+  if (missing.length) errors.push(`label(s) ${missing.join(", ")} missing`);
+  return errors;
 }
 
 async function listRecent(
@@ -2417,8 +2574,14 @@ export const model = {
         '(default "Backlog", override with bucketName) so it lands in a ' +
         "backlog column rather than the view's default working column. " +
         "Optionally attaches existing labels by title (label and/or " +
-        "labels; all resolved before anything is created) and skips " +
-        "creation if a non-done task with the same title already exists.",
+        "labels; all resolved before anything is created). Refuses, with " +
+        "nothing created, a card that does not meet the readiness rules of " +
+        "its target bucket (ready: full Definition of Ready; waiting: a due " +
+        "date; doing/review/done: never) or of requireReady. duplicateTitle " +
+        "(refuse/skip/allow, default skip) handles an open card with the " +
+        "same title, case-insensitively. Reads back title, description, " +
+        "priority, due date, labels and bucket; a mismatch is an error " +
+        "naming the task id.",
       arguments: NewTaskArgsSchema,
       execute: newTask,
     },
