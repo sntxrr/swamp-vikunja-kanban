@@ -461,10 +461,15 @@ const MoveTaskArgsSchema = z.object({
   taskId: TaskId,
   bucketName: z.string().min(1).describe(
     "Bucket title (case-insensitive) to move the card into. The done " +
-      "bucket is refused; use close_task.",
+      "bucket is refused; use close_task. Moving into the ready bucket " +
+      "needs the full Definition of Ready, and into waiting a due date.",
   ),
   projectId: BoardProject,
-  force: Force,
+  force: Force.describe(
+    "Write even though the card was updated within " +
+      "policy.recentEditMinutes by something other than this model, or " +
+      "does not meet the target bucket's readiness rules.",
+  ),
 });
 
 const CloseTaskArgsSchema = z.object({
@@ -1496,6 +1501,19 @@ export function formatProblems(ps: ReadinessProblem[]): string {
   return ps.map((p) => `${p.rule} (${p.detail})`).join("; ");
 }
 
+/** The readiness view of a raw Vikunja task object. */
+function cardStateOf(raw: Record<string, unknown>): CardState {
+  return {
+    title: typeof raw.title === "string" ? raw.title : "",
+    description: typeof raw.description === "string" ? raw.description : "",
+    labels: asArray(raw.labels).map((l) => l.title).filter((
+      t,
+    ): t is string => typeof t === "string"),
+    priority: typeof raw.priority === "number" ? raw.priority : 0,
+    dueDate: dueDateOf(raw.due_date),
+  };
+}
+
 /** Title comparison used for duplicate detection: trimmed, case-insensitive. */
 export function sameTitle(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -2185,6 +2203,22 @@ async function moveTask(
   if (from.toLowerCase() === target.title.toLowerCase()) {
     ctx.logger?.info(`Task ${args.taskId}: already in "${from}"`);
   } else {
+    // The same rules audit applies to the column: a card is only promoted
+    // into the ready column when it passes the Definition of Ready, and
+    // only parked in waiting with a due date.
+    const problems = readinessProblems(
+      cardStateOf(task),
+      roleOf(target.title, g.bucketRoles),
+      g.policy,
+      { intent: "move" },
+    );
+    if (problems.length && !args.force) {
+      throw new Error(
+        `Refusing to move task ${args.taskId} into "${target.title}": ` +
+          `${formatProblems(problems)}. Fix the card first, or pass ` +
+          `force: true.`,
+      );
+    }
     await moveTaskToBucket(g, projectId, viewId, target.id, args.taskId);
     const now = await bucketTitleOf(g, projectId, viewId, args.taskId);
     if (now !== target.title) {
@@ -2610,7 +2644,10 @@ export const model = {
     move_task: {
       description:
         "Move one card into a named bucket and read its placement back " +
-        "from the kanban view. Refuses the done bucket (use close_task), " +
+        "from the kanban view. Moving into the ready bucket requires the " +
+        "full Definition of Ready, and into waiting a due date (refusal " +
+        "lists the findings; force: true overrides). Refuses the done " +
+        "bucket (use close_task), " +
         "done cards, and cards someone else updated within " +
         "policy.recentEditMinutes unless force: true. Run it after any " +
         "field edits: a full-replace write can drop a card out of its " +

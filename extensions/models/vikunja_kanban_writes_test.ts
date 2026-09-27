@@ -643,7 +643,12 @@ Deno.test("set_labels refuses unknown titles and add/remove overlap", async () =
 
 Deno.test("move_task moves and reads the placement back", async () => {
   const f = new FakeVikunja();
-  const id = f.seed({ bucket: 10 });
+  const id = f.seed({
+    bucket: 10,
+    description: READY_BODY,
+    priority: 3,
+    labelIds: [1, 2],
+  });
   await withFake(f, async (run, store) => {
     await run("move_task", { taskId: id, bucketName: "next" });
     assertEquals(
@@ -653,6 +658,50 @@ Deno.test("move_task moves and reads the placement back", async () => {
     );
   });
   assertStrictEquals(bucketTitle(f, id), "Next");
+});
+
+Deno.test("move_task refuses an unready card into Next, listing the findings", async () => {
+  const f = new FakeVikunja();
+  const stub = f.seed({ bucket: 10, labelIds: [2] });
+  await withFake(f, async (run) => {
+    const err = await assertRejects(
+      () => run("move_task", { taskId: stub, bucketName: "Next" }),
+      Error,
+      "Refusing to move task",
+    );
+    for (
+      const rule of [
+        "short-description",
+        "missing-area-label",
+        "missing-verdict",
+        "missing-acceptance",
+        "missing-link",
+      ]
+    ) assert(err.message.includes(rule), `${rule}: ${err.message}`);
+    assertEquals(f.writes, []);
+    // force is the explicit override.
+    await run("move_task", { taskId: stub, bucketName: "Next", force: true });
+  });
+  assertStrictEquals(bucketTitle(f, stub), "Next");
+});
+
+Deno.test("move_task into Waiting needs a due date", async () => {
+  const f = new FakeVikunja();
+  const undated = f.seed();
+  const dated = f.seed({ due_date: "2026-11-04T17:00:00Z" });
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () => run("move_task", { taskId: undated, bucketName: "Waiting" }),
+      Error,
+      "missing-due-date",
+    );
+    assertEquals(f.writes, []);
+    await run("move_task", { taskId: dated, bucketName: "Waiting" });
+    // Other columns stay light: Doing takes the stub as it is.
+    await run("move_task", { taskId: undated, bucketName: "Doing" });
+  });
+  assertStrictEquals(bucketTitle(f, dated), "Waiting");
+  assertStrictEquals(bucketTitle(f, undated), "Doing");
 });
 
 Deno.test("move_task refuses the done bucket and done cards", async () => {
