@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.09.27.4",
+  "reviewedAt": "2026-09-27T22:13:39Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No new credential fields. apiToken stays .meta({sensitive:true}) via vault reference; vreq errors carry method/path/status/body only. New methods (board, get_task, apply_plan) log counts, ids and titles, never the token."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Fixed in 2026.09.27.3 (PR #13): all 23 log calls use a constant message template with values as structured properties, and every method logs one start line ({method}: starting) with only the ids it targets (taskId, projectId, bucketName, apply, op count) -- never descriptions or arguments wholesale. A test runs 16 method calls with a recording logger and fails on a missing start line, a placeholder without a value, or a number in the message text; it failed before the fix. warning is used for a card moved back into its bucket and for each dry-run plan problem. No sensitive values logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "apply_plan: every op is validated against one board read before any write; apply:true with any problem throws 'wrote nothing' and a test asserts zero HTTP writes. At run time each op goes through its single method, which re-checks the recent-edit guard and readiness on live state, so a card edited between validation and apply stops the run instead of being overwritten. A mid-run failure throws naming done / failed / not-run ops after recording planResult. new_task/move_task refuse on readiness before writing; new_task's read-back mismatch records task-<id> then throws naming the created id."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "62 tests pass. New in .4: the harness rejects a duplicate instance name per run (it exposed the existing mixed-ops test, which had two ops on one card); a test replays the live shape (update+close on one card, labels+update+move on another) and checks the final state is recorded and a follow-up edit passes the guard; the mid-run-stop test asserts the landed op is recorded. Removing the flush fails 3 tests. Carried: structured-logging test over 16 method calls, 19 write-path tests that fail on 2026.09.27.1, 112-pair audit regression."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "apply_plan's buffered records are flushed on success and on a mid-run stop alike, so every write that landed is recorded as this model's own (tested: after a stop at op #1, op #0's card has its task-<id>, the failed card none). Within a run the guard reads the buffered records, so several ops on one card still pass. new_task duplicateTitle defaults to skip (refuse inside a plan); a skip records get-<id>. apply_plan is not transactional by design: it stops at the first failure and reports done/failed/not-run. Follow-up: set_due_date still fails ('move it back by hand') rather than restoring the bucket if a full-replace write un-buckets the card."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "issue",
+      "note": "Follow-up, pre-existing: fetchBoard stops after 100 pages without a truncated flag on boardAudit/boardSnapshot (live board is ~120 cards, one page per bucket). Otherwise unchanged endpoints; labels and title search page via fetchAllPages; 429 Retry-After honoured. Duplicate lookup reads the board rather than trusting the server's `s` search for case handling."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No files or long-lived handles; fetch timeouts cleared in finally. apply_plan reads labels at most once per plan. Each single-method op still re-reads the board 2-4 times for bucket checks; that is plain HTTP inside one method run (no per-op datastore sync), the cost the batch exists to avoid."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Re-scanned for 2026.09.27.4: the 43 denylist patterns (comments stripped, as the hook does) match nothing in README.md, extensions/, manifest.yaml or LICENSE.md. Fixtures use example domains and fictional labels; the new test uses generic titles. PR #15's body names only the public API."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "issue",
+      "note": "Pre-existing, deliberate: VikunjaTaskSchema passes Vikunja's full task object through. The new BoardSnapshotSchema and PlanResultSchema also use .passthrough() though every field is built by the model; harmless, can be tightened later. get_task's `bucket` and create's `placement` are declared fields. New argument schemas are strict, with PlanOpSchema a discriminated union on `op`."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "New specs boardSnapshot and planResult declare lifetime and garbageCollection like the others."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Create (new_task, apply_plan create), read (board, get_task, list_recent, audit, due_report), update (update_task/set_labels/move_task/set_due_date and plan ops), close (close_task, plan close with humanInstructed). No delete: cards are closed, never deleted."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "Follow-up, carried: guards (done card, recent edit, readiness per bucket, done bucket, humanInstructed) are inline rather than labelled swamp pre-flight checks; force / humanInstructed / requireReady / duplicateTitle are the explicit overrides, and apply_plan's dry run is the batch pre-flight."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Corrected in 2026.09.27.4. The 2026.09.27.2 and .3 reviews passed this dimension wrongly: apply_plan wrote vikunjaTask task-<id> once per op, so a plan with two ops on one card wrote the same instance name twice in one run, and swamp failed the live 2026-09-27 pass ('Duplicate data instance name task-84') after all 13 ops had landed. apply_plan now buffers the single methods' records, keeps the last (final) state per name, and writes each once at the end. Names: task-<id> = this model's own last write, get-<id> = reads (get_task, new_task duplicate skip), list-<id> = list_recent; board-/plan-/audit-/reorder-/due-<project> per spec. The test harness now fails any run that writes a name twice, as swamp does, so every method is checked on every test."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The recent-edit guard reads context.readResource('task-<id>'); a read failure falls through to refuse. No direct dataRepository access."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.09.27.4 adds an upgrades[] entry with identity upgradeAttributes: apply_plan's record writes only; no argument, resource or behaviour changes to Vikunja writes, so existing instances carry over."
+    }
+  ]
+}
