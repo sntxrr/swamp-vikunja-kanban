@@ -191,6 +191,11 @@ const VikunjaTaskSchema = z.object({
     "Kanban bucket this run placed the task into (absent when placement " +
       "was disabled or the task already existed).",
   ),
+  bucket: z.object({ title: z.string(), role: z.string() }).nullable()
+    .optional().describe(
+      "Bucket the card sat in when get_task read it (null: not on the " +
+        "kanban view).",
+    ),
   created: z.string().nullable().optional().describe(
     "Creation timestamp from Vikunja.",
   ),
@@ -318,6 +323,39 @@ const DueReportSchema = z.object({
 /** The `dueReport` resource written by due_report. */
 export type DueReport = z.infer<typeof DueReportSchema>;
 
+const BoardCardSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  description: z.string().describe("Description HTML as stored."),
+  bucket: z.string().describe("Title of the bucket the card sits in."),
+  role: z.string().describe("That bucket's role (bucketRoles), or other."),
+  labels: z.array(z.string()),
+  priority: z.number(),
+  dueDate: z.string().nullable().describe("ISO 8601, or null when unset."),
+  updated: z.string(),
+  created: z.string(),
+  position: z.number().describe("Position within the bucket (view order)."),
+});
+
+const BoardSnapshotSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  fetchedAt: z.string(),
+  buckets: z.array(z.object({
+    id: z.number(),
+    title: z.string(),
+    role: z.string(),
+    count: z.number().describe("Cards of this bucket in `cards`."),
+  })).describe("Every bucket in view order, the done bucket included."),
+  cards: z.array(BoardCardSchema).describe(
+    "Every card that is not done and not in the done bucket, bucket by " +
+      "bucket in view order.",
+  ),
+  total: z.number(),
+}).passthrough();
+/** The `boardSnapshot` resource written by board. */
+export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
+
 // ============================================================================
 // Method argument schemas
 // ============================================================================
@@ -379,6 +417,18 @@ type NewTaskArgs = z.infer<typeof NewTaskArgsSchema>;
 
 const AuditArgsSchema = z.object({
   projectId: ProjectIdOverride,
+});
+
+const BoardArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+});
+
+const GetTaskArgsSchema = z.object({
+  taskId: z.number().int().positive().describe("Vikunja task id."),
+  projectId: ProjectIdOverride.describe(
+    "Project whose kanban view is read for the card's bucket. Defaults to " +
+      "the configured projectId.",
+  ),
 });
 
 const DueReportArgsSchema = z.object({
@@ -1905,6 +1955,104 @@ async function dueReport(
   return { dataHandles: [handle] };
 }
 
+/**
+ * The not-done cards of a board as one flat, bucket-ordered list, with the
+ * fields a planner needs (the whole description included).
+ */
+export function snapshotBoard(
+  board: BoardBucket[],
+  roles: Roles,
+): Pick<BoardSnapshot, "buckets" | "cards" | "total"> {
+  const buckets: BoardSnapshot["buckets"] = [];
+  const cards: BoardSnapshot["cards"] = [];
+  for (const b of board) {
+    const role = roleOf(b.title, roles);
+    const open = role === "done" ? [] : b.tasks.filter((t) => !t.done);
+    buckets.push({ id: b.id, title: b.title, role, count: open.length });
+    for (const t of open) {
+      cards.push({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        bucket: b.title,
+        role,
+        labels: t.labels,
+        priority: t.priority,
+        dueDate: t.dueDate,
+        updated: t.updated,
+        created: t.created,
+        position: t.position,
+      });
+    }
+  }
+  return { buckets, cards, total: cards.length };
+}
+
+/**
+ * Read-only: write every not-done card on the board, with its bucket,
+ * role, labels, priority, due date and full description, as one
+ * boardSnapshot resource, so a caller can plan a batch from one read.
+ */
+async function boardMethod(
+  args: z.infer<typeof BoardArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  const snapshot = BoardSnapshotSchema.parse({
+    projectId,
+    viewId,
+    fetchedAt,
+    ...snapshotBoard(board, g.bucketRoles),
+  });
+  const handle = await ctx.writeResource(
+    "boardSnapshot",
+    `board-${projectId}`,
+    snapshot,
+  );
+  ctx.logger?.info(
+    `Board of project ${projectId}: ${snapshot.total} open cards in ` +
+      `${snapshot.buckets.length} buckets`,
+  );
+  return { dataHandles: [handle] };
+}
+
+/**
+ * Read-only: one card and the bucket it sits in, written as a vikunjaTask
+ * resource named `get-<id>`. Not `task-<id>`: that name records this
+ * model's own last write, which the recent-edit guard trusts, and a read
+ * must never make someone else's edit look like ours.
+ */
+async function getTask(
+  args: z.infer<typeof GetTaskArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const task = await readTask(g, args.taskId);
+  const title = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `get-${args.taskId}`,
+    toVikunjaTask({
+      ...task,
+      bucket: title === null
+        ? null
+        : { title, role: roleOf(title, g.bucketRoles) },
+    }, fetchedAt),
+  );
+  ctx.logger?.info(`Task ${args.taskId}: in "${title}"`);
+  return { dataHandles: [handle] };
+}
+
 /** Bucket title a task currently sits in on the project's kanban view. */
 async function bucketTitleOf(
   g: GlobalArgs,
@@ -2568,6 +2716,14 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
+    boardSnapshot: {
+      description:
+        "Every not-done card on a board with its bucket, role, labels, " +
+        "priority, due date, timestamps and full description.",
+      schema: BoardSnapshotSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
   },
   methods: {
     audit: {
@@ -2674,6 +2830,22 @@ export const model = {
         "closing a card is a person's decision.",
       arguments: CloseTaskArgsSchema,
       execute: closeTask,
+    },
+    board: {
+      description:
+        "Read-only: write every not-done card on the project's kanban " +
+        "board (id, title, full description, bucket and its role, labels, " +
+        "priority, due date, updated) as one boardSnapshot resource, read " +
+        "page by page so no bucket is truncated.",
+      arguments: BoardArgsSchema,
+      execute: boardMethod,
+    },
+    get_task: {
+      description:
+        "Read-only: one card plus the bucket (and role) it sits in, " +
+        "written as the vikunjaTask resource get-<id>.",
+      arguments: GetTaskArgsSchema,
+      execute: getTask,
     },
     list_recent: {
       description:

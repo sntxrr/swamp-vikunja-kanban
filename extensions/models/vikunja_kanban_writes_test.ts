@@ -497,6 +497,87 @@ Deno.test("duplicateTitle: refuse and skip match case-insensitively; allow creat
   assertStrictEquals(f.tasks.size, 4);
 });
 
+// ------------------------------------------------------------ board / get_task
+
+Deno.test("board writes every not-done card with bucket, role and fields", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed({
+    bucket: 11,
+    labelIds: [1, 2],
+    description: READY_BODY,
+    due_date: "2026-11-04T17:00:00Z",
+  });
+  const b = f.seed({ bucket: 10 });
+  f.seed({ bucket: 13, done: true });
+  await withFake(f, async (run, store) => {
+    await run("board", {});
+    const snap = store.get("board-5")! as {
+      total: number;
+      buckets: { title: string; role: string; count: number }[];
+      cards: Record<string, unknown>[];
+    };
+    assertStrictEquals(snap.total, 2);
+    assertEquals(snap.cards.map((c) => c.id), [b, a]);
+    assertEquals(
+      snap.buckets.map((x) => [x.title, x.role, x.count]),
+      [
+        ["Backlog", "backlog", 1],
+        ["Next", "ready", 1],
+        ["Doing", "doing", 0],
+        ["Done", "done", 0],
+        ["Waiting", "waiting", 0],
+      ],
+    );
+    const card = snap.cards[1];
+    assertEquals(card.bucket, "Next");
+    assertEquals(card.role, "ready");
+    assertEquals(card.labels, ["automation", "tier-B"]);
+    assertEquals(card.description, READY_BODY);
+    assertEquals(card.dueDate, "2026-11-04T17:00:00Z");
+    assertEquals(card.priority, 2);
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("board: a 120-card board with full bodies stays small", async () => {
+  const f = new FakeVikunja();
+  for (let i = 0; i < 120; i++) {
+    f.seed({
+      bucket: [10, 11, 12, 14][i % 4],
+      description: READY_BODY,
+      labelIds: [1, 2],
+    });
+  }
+  await withFake(f, async (run, store) => {
+    await run("board", {});
+    const snap = store.get("board-5")!;
+    assertStrictEquals(snap.total, 120);
+    const bytes = new TextEncoder().encode(JSON.stringify(snap)).length;
+    // ~0.95 KB per card with a ~670-char body (about 113 KB in all).
+    assert(bytes < 200_000, `snapshot is ${bytes} bytes`);
+  });
+});
+
+Deno.test("get_task records the card and its bucket as get-<id>, not task-<id>", async () => {
+  const f = new FakeVikunja();
+  // Edited by someone a moment ago.
+  const id = f.seed({ bucket: 11, updated: new Date().toISOString() });
+  await withFake(f, async (run, store) => {
+    await run("get_task", { taskId: id });
+    const got = store.get(`get-${id}`)!;
+    assertEquals(got.bucket, { title: "Next", role: "ready" });
+    assertStrictEquals(got.id, id);
+    assert(!store.has(`task-${id}`));
+    // A read must not make that edit look like ours.
+    await assertRejects(
+      () => run("update_task", { taskId: id, priority: 4 }),
+      Error,
+      "force: true",
+    );
+  });
+  assertEquals(f.writes, []);
+});
+
 // ------------------------------------------------------------- update_task
 
 Deno.test("update_task changes only the named fields", async () => {
