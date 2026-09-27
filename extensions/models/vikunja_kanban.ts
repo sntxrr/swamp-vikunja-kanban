@@ -129,7 +129,8 @@ const GlobalArgsSchema = z.object({
       "Within equal priority, whether older or newer cards sort first.",
     ),
     recentEditMinutes: z.number().int().min(0).default(60).describe(
-      "Write methods (update_task, set_labels, move_task) refuse a card " +
+      "Write methods (update_task, set_labels, move_task, set_due_date, " +
+        "and their apply_plan ops) refuse a card " +
         "updated within this many minutes unless the last update was this " +
         "model's own recorded write, or force: true is passed. It keeps " +
         "automation from overwriting a card someone is editing. 0 disables.",
@@ -3235,7 +3236,7 @@ async function runOp(
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.27.1",
+  version: "2026.09.27.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3324,6 +3325,25 @@ export const model = {
         "first page as not found. set_labels reads the labels once for " +
         "both add and remove. new_task's skipIfTitleExists lookup is paged " +
         "the same way. Existing model attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.27.2",
+      description:
+        "Added apply_plan (validate a batch of create/update/labels/move/" +
+        "due/close ops against one read of the board, dry run by default; " +
+        "apply: true writes nothing unless every op is valid, then runs " +
+        "them in order and records a planResult resource), board (every " +
+        "open card as a boardSnapshot resource) and get_task (one card and " +
+        "its bucket as get-<id>). The Definition-of-Ready rules are shared " +
+        "by audit and the writes: new_task refuses a card that does not " +
+        "meet its target bucket's rules (ready: full DoR; waiting: a due " +
+        "date; doing/review/done: never), gains requireReady and " +
+        "duplicateTitle (refuse/skip/allow, case-insensitive; default skip " +
+        "as before, skipIfTitleExists kept as an alias), and reads back " +
+        "every field; move_task enforces the same rules for ready and " +
+        "waiting; set_due_date gains the recent-edit guard and force. " +
+        "Existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

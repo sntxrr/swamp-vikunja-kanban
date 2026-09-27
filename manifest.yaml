@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.09.27.1"
+version: "2026.09.27.2"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -20,7 +20,19 @@ description: |
   - **new_task** — Create a task in a Vikunja project (default or per-call
     projectId), placing it in a named bucket (bucketName) and optionally
     attaching existing labels by title (label / labels), all resolved
-    before anything is created.
+    before anything is created. Refuses a card that does not meet its
+    target bucket's readiness rules (ready: full Definition of Ready;
+    waiting: a due date; doing/review/done: never) or requireReady;
+    duplicateTitle refuse/skip/allow (default skip); every field is read
+    back.
+  - **apply_plan** — Batch writes in one run: validate every create /
+    update / labels / move / due / close op against one read of the board
+    and report all problems (dry run by default); with apply: true, write
+    nothing unless every op is valid, then run them in order with
+    read-backs, stopping at the first failure. Records a planResult.
+  - **board** — Read-only: every open card (full description, bucket and
+    role, labels, priority, due date) as one boardSnapshot resource.
+  - **get_task** — Read-only: one card and the bucket it sits in.
   - **list_recent** — List the most recently created tasks in a project.
   - **audit** — Read-only Definition-of-Ready audit of the whole board:
     empty/short descriptions, missing labels or label groups, unset
@@ -43,11 +55,13 @@ description: |
   - **set_labels** — Attach and detach existing labels on one card by title
     through the label endpoints, with read-back.
   - **move_task** — Move one card into a named bucket (never the done
-    bucket) and read the placement back.
+    bucket) and read the placement back; the ready bucket needs the full
+    Definition of Ready and waiting a due date, unless force: true.
   - **close_task** — Mark one card done and move it into the done bucket;
     runs only with humanInstructed: true.
 
-  The edit methods refuse done cards and cards someone else updated within
+  The edit methods (update_task, set_labels, move_task, set_due_date)
+  refuse done cards and cards someone else updated within
   policy.recentEditMinutes unless force: true.
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
 paths:
