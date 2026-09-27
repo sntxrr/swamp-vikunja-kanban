@@ -878,3 +878,285 @@ Deno.test("close_task needs humanInstructed, then closes and reads back", async 
   assertStrictEquals(f.tasks.get(id)!.done, true);
   assertStrictEquals(bucketTitle(f, id), "Done");
 });
+
+// -------------------------------------------------------------- apply_plan
+
+type PlanResultLike = {
+  outcome: string;
+  valid: boolean;
+  counts: Record<string, number>;
+  problems: { index: number | null; problem: string }[];
+  ops: {
+    index: number;
+    status: string;
+    taskId: number | null;
+    problems: string[];
+    error?: string;
+  }[];
+};
+const planOf = (store: Map<string, Record<string, unknown>>) =>
+  store.get("plan-5") as unknown as PlanResultLike;
+
+/** A plan with one problem of every kind, plus one valid op (#0). */
+function badPlan(f: FakeVikunja) {
+  const ok = f.seed({ title: "fine card" });
+  const done = f.seed({ done: true, bucket: 13 });
+  const hot = f.seed({ updated: new Date().toISOString() });
+  const stub = f.seed({ title: "Existing Title", labelIds: [2] });
+  const closing = f.seed();
+  return {
+    ids: { ok, done, hot, stub, closing },
+    ops: [
+      { op: "update", taskId: ok, priority: 4 }, // #0 valid
+      { op: "update", taskId: 999, priority: 1 }, // #1 unknown task
+      { op: "labels", taskId: done, add: ["storage"] }, // #2 done card
+      { op: "update", taskId: hot, priority: 1 }, // #3 recent edit
+      { op: "labels", taskId: ok, add: ["no-such-label"] }, // #4 unknown label
+      { op: "move", taskId: ok, bucketName: "Icebox" }, // #5 unknown bucket
+      { op: "create", title: "stub", bucketName: "Next" }, // #6 not ready
+      { op: "create", title: "existing title", requireReady: false }, // #7 dup on board
+      { op: "create", title: "twin", requireReady: false }, // #8 valid alone
+      { op: "create", title: "TWIN ", requireReady: false }, // #9 dup in plan
+      { op: "move", taskId: stub, bucketName: "Next" }, // #10 unready move
+      { op: "close", taskId: closing }, // #11 no humanInstructed
+      { op: "update", taskId: closing, priority: 5 }, // #12 after close
+      { op: "update", taskId: stub }, // #13 no fields
+      { op: "due", taskId: ok, dueDate: "someday" }, // #14 bad date
+    ],
+  };
+}
+
+Deno.test("apply_plan dry run writes nothing and reports every problem", async () => {
+  const f = new FakeVikunja();
+  const { ops } = badPlan(f);
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", { ops });
+    const r = planOf(store);
+    assertEquals(r.outcome, "dry-run");
+    assertEquals(r.valid, false);
+    const byOp = (i: number) => r.ops[i].problems.join(" | ");
+    assertEquals(r.ops[0].status, "ok");
+    assertEquals(r.ops[8].status, "ok");
+    const expect: Array<[number, string]> = [
+      [1, "task 999 is not on the board"],
+      [2, "is done"],
+      [3, "force: true"],
+      [4, "unknown label(s): no-such-label"],
+      [5, 'unknown bucket "Icebox"'],
+      [6, "empty-description"],
+      [6, "no-labels"],
+      [7, "already has this title"],
+      [9, "duplicates the title of op #8"],
+      [10, 'not ready for "Next"'],
+      [10, "missing-area-label"],
+      [11, "humanInstructed: true"],
+      [12, "closed by op #11"],
+      [13, "at least one of title, description, priority"],
+      [14, "not a parseable instant"],
+    ];
+    for (const [i, text] of expect) {
+      assertEquals(r.ops[i].status, "invalid", `op #${i}`);
+      assert(byOp(i).includes(text), `op #${i}: ${byOp(i)}`);
+    }
+    assertEquals(r.counts.ops, 15);
+    assertEquals(
+      new Set(r.problems.map((p) => p.index)).size,
+      13,
+      "every bad op is listed, not just the first",
+    );
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("apply_plan with apply: true and one bad op writes nothing", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed();
+  const b = f.seed();
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () =>
+        run("apply_plan", {
+          apply: true,
+          ops: [
+            { op: "update", taskId: a, priority: 4 },
+            { op: "labels", taskId: a, add: ["storage"] },
+            { op: "due", taskId: b, dueDate: "2026-11-04T17:00:00Z" },
+            { op: "labels", taskId: b, add: ["storag"] }, // the bad one
+            { op: "update", taskId: b, title: "renamed" },
+          ],
+        }),
+      Error,
+      "wrote nothing: 1 problem(s)",
+    );
+    const r = planOf(store);
+    assertEquals(r.outcome, "refused");
+    assertEquals(r.ops.map((o) => o.status), [
+      "ok",
+      "ok",
+      "ok",
+      "invalid",
+      "ok",
+    ]);
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("apply_plan applies mixed ops in order with read-backs", async () => {
+  const f = new FakeVikunja();
+  // Edited moments ago by someone: the first op forces, later ops on the
+  // same card pass because the plan's own write is recorded as ours.
+  const groom = f.seed({
+    title: "Groom me",
+    updated: new Date().toISOString(),
+  });
+  const closing = f.seed({ bucket: 12 });
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", {
+      apply: true,
+      ops: [
+        {
+          op: "create",
+          title: "Brand new ready card",
+          description: READY_BODY,
+          labels: ["automation", "tier-B"],
+          priority: 3,
+          bucketName: "Next",
+        },
+        {
+          op: "update",
+          taskId: groom,
+          description: READY_BODY,
+          priority: 4,
+          force: true,
+        },
+        { op: "labels", taskId: groom, add: ["storage", "tier-B"] },
+        { op: "due", taskId: groom, dueDate: "2026-11-04T17:00:00Z" },
+        { op: "move", taskId: groom, bucketName: "Next" },
+        { op: "close", taskId: closing, humanInstructed: true },
+      ],
+    });
+    const r = planOf(store);
+    assertEquals(r.outcome, "applied");
+    assertEquals(r.ops.map((o) => o.status), Array(6).fill("done"));
+    const created = r.ops[0].taskId!;
+    assert(created > closing, `created id ${created}`);
+    for (const id of [created, groom, closing]) {
+      assert(store.has(`task-${id}`), `task-${id} recorded`);
+    }
+    // The last write to a card is what its task-<id> records.
+    assertEquals(
+      store.get(`task-${groom}`)!.updated,
+      f.tasks.get(groom)!.updated,
+    );
+  });
+  const newest = Math.max(...f.tasks.keys());
+  assertStrictEquals(bucketTitle(f, newest), "Next");
+  assertEquals(labelTitles(f, newest), ["automation", "tier-B"]);
+  const g = f.tasks.get(groom)!;
+  assertStrictEquals(g.description, READY_BODY);
+  assertStrictEquals(g.priority, 4);
+  assertStrictEquals(g.due_date, "2026-11-04T17:00:00Z");
+  assertEquals(labelTitles(f, groom), ["storage", "tier-B"]);
+  assertStrictEquals(bucketTitle(f, groom), "Next");
+  assertStrictEquals(f.tasks.get(closing)!.done, true);
+  assertStrictEquals(bucketTitle(f, closing), "Done");
+});
+
+Deno.test("apply_plan judges a move on the state earlier ops leave", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed({ description: READY_BODY, priority: 3, labelIds: [1] });
+  await withFake(f, async (run, store) => {
+    // Move before the label op that makes it ready: refused, with a hint.
+    await run("apply_plan", {
+      ops: [
+        { op: "move", taskId: id, bucketName: "Next" },
+        { op: "labels", taskId: id, add: ["tier-B"] },
+      ],
+    });
+    const bad = planOf(store);
+    assertEquals(bad.ops[0].status, "invalid");
+    assert(
+      bad.ops[0].problems[0].includes("op #1 changes this card later"),
+      bad.ops[0].problems[0],
+    );
+    // Swapped: valid.
+    await run("apply_plan", {
+      ops: [
+        { op: "labels", taskId: id, add: ["tier-B"] },
+        { op: "move", taskId: id, bucketName: "Next" },
+      ],
+    });
+    assertEquals(planOf(store).valid, true);
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("apply_plan stops at a mid-run failure and reports not-run ops", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed();
+  const b = f.seed();
+  const c = f.seed({ labelIds: [1] });
+  f.ignoreOnWrite = ["description"]; // b's description write will not stick
+  await withFake(f, async (run, store) => {
+    const err = await assertRejects(
+      () =>
+        run("apply_plan", {
+          apply: true,
+          ops: [
+            { op: "update", taskId: a, priority: 5 },
+            { op: "update", taskId: b, description: "<p>new body</p>" },
+            { op: "labels", taskId: c, add: ["storage"] },
+            { op: "due", taskId: c, dueDate: "2026-11-04T17:00:00Z" },
+          ],
+        }),
+      Error,
+      "stopped at op #1 (update)",
+    );
+    assert(err.message.includes("not run: #2, #3"), err.message);
+    const r = planOf(store);
+    assertEquals(r.outcome, "failed");
+    assertEquals(r.ops.map((o) => o.status), [
+      "done",
+      "failed",
+      "not-run",
+      "not-run",
+    ]);
+    assert(r.ops[1].error!.includes("description did not read back"));
+    assertEquals(r.counts.done, 1);
+    assertEquals(r.counts.notRun, 2);
+  });
+  assertStrictEquals(f.tasks.get(a)!.priority, 5);
+  assertEquals(labelTitles(f, c), ["automation"]);
+});
+
+Deno.test("apply_plan: maxOps cap, and duplicateTitle skip leaves the op out", async () => {
+  const f = new FakeVikunja();
+  const existing = f.seed({ title: "Already here" });
+  const ops = Array.from({ length: 3 }, (_, i) => ({
+    op: "update",
+    taskId: existing,
+    priority: i + 1,
+  }));
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", { ops, maxOps: 2 });
+    const capped = planOf(store);
+    assertEquals(capped.valid, false);
+    assertEquals(capped.problems[0].index, null);
+    assert(capped.problems[0].problem.includes("more than maxOps 2"));
+
+    await run("apply_plan", {
+      apply: true,
+      ops: [{
+        op: "create",
+        title: "already HERE",
+        duplicateTitle: "skip",
+        requireReady: false,
+      }],
+    });
+    const r = planOf(store);
+    assertEquals(r.outcome, "applied");
+    assertEquals(r.ops[0].status, "skip");
+    assertEquals(r.ops[0].taskId, existing);
+  });
+  assertEquals(f.writes, []);
+});

@@ -356,6 +356,53 @@ const BoardSnapshotSchema = z.object({
 /** The `boardSnapshot` resource written by board. */
 export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
 
+const PlanOpResultSchema = z.object({
+  index: z.number().describe("0-based position in ops."),
+  op: z.string(),
+  taskId: z.number().nullable().describe(
+    "The card the op targets; for a create, the id it got (or the " +
+      "existing card a skip found).",
+  ),
+  title: z.string().nullable(),
+  status: z.enum(["ok", "invalid", "skip", "done", "failed", "not-run"])
+    .describe(
+      "ok: valid, not run (dry run, or refused plan). invalid: has " +
+        "problems. skip: a create whose title exists (duplicateTitle " +
+        "skip). done / failed / not-run: what apply did.",
+    ),
+  problems: z.array(z.string()),
+  error: z.string().optional().describe("Why a failed op failed."),
+});
+
+const PlanResultSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  plannedAt: z.string(),
+  outcome: z.enum(["dry-run", "refused", "applied", "failed"]).describe(
+    "dry-run: nothing written. refused: apply was asked but at least one " +
+      "problem was found, so nothing was written. applied: every op ran " +
+      "and read back. failed: stopped at the first failing op.",
+  ),
+  valid: z.boolean().describe("True when validation found no problems."),
+  counts: z.object({
+    ops: z.number(),
+    problems: z.number(),
+    done: z.number(),
+    failed: z.number(),
+    notRun: z.number(),
+    skipped: z.number(),
+  }),
+  problems: z.array(z.object({
+    index: z.number().nullable().describe("null: a plan-level problem."),
+    op: z.string().nullable(),
+    taskId: z.number().nullable(),
+    problem: z.string(),
+  })).describe("Every validation problem, in op order."),
+  ops: z.array(PlanOpResultSchema),
+}).passthrough();
+/** The `planResult` resource written by apply_plan. */
+export type PlanResult = z.infer<typeof PlanResultSchema>;
+
 // ============================================================================
 // Method argument schemas
 // ============================================================================
@@ -563,6 +610,95 @@ const ListRecentArgsSchema = z.object({
     "Include tasks already marked done.",
   ),
 });
+
+const PlanForce = z.boolean().default(false).describe(
+  "Per-op override, as on the single methods: write despite the " +
+    "recent-edit guard (and, for move, the target bucket's readiness " +
+    "rules; for due, clearing a waiting card's date).",
+);
+
+const PlanOpSchema = z.discriminatedUnion("op", [
+  z.object({
+    op: z.literal("create"),
+    title: z.string().min(1),
+    description: z.string().optional(),
+    labels: z.array(z.string().min(1)).default([]),
+    priority: z.number().int().min(0).max(5).optional(),
+    dueDate: z.string().optional(),
+    bucketName: z.string().optional().describe(
+      "Default: the defaultBucketName global argument.",
+    ),
+    duplicateTitle: z.enum(["refuse", "skip", "allow"]).default("refuse")
+      .describe(
+        "As new_task, but refuse by default inside a plan. skip leaves " +
+          "the op out of the run and reports the existing card.",
+      ),
+    requireReady: z.boolean().optional().describe(
+      "Overrides the plan's requireReady for this create.",
+    ),
+  }),
+  z.object({
+    op: z.literal("update"),
+    taskId: z.number().int().positive(),
+    title: z.string().optional(),
+    description: z.string().optional(),
+    priority: z.number().int().min(0).max(5).optional(),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("labels"),
+    taskId: z.number().int().positive(),
+    add: z.array(z.string().min(1)).default([]),
+    remove: z.array(z.string().min(1)).default([]),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("move"),
+    taskId: z.number().int().positive(),
+    bucketName: z.string().min(1),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("due"),
+    taskId: z.number().int().positive(),
+    dueDate: z.string().nullable().describe('ISO 8601; null or "" clears.'),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("close"),
+    taskId: z.number().int().positive(),
+    humanInstructed: z.boolean().default(false).describe(
+      "Must be true on every close op: a person asked for it.",
+    ),
+  }),
+]);
+/** One operation of an apply_plan batch. */
+export type PlanOp = z.infer<typeof PlanOpSchema>;
+
+const ApplyPlanArgsSchema = z.object({
+  ops: z.array(PlanOpSchema).min(1).describe(
+    "Operations, run in this order. Discriminated on `op`: create " +
+      "(new_task fields), update (taskId + title/description/priority), " +
+      "labels (taskId + add/remove), move (taskId + bucketName), due " +
+      "(taskId + dueDate, null clears), close (taskId + humanInstructed: " +
+      "true).",
+  ),
+  apply: z.boolean().default(false).describe(
+    "false (default): validate every op against the live board and write " +
+      "only the planResult resource. true: validate, and write NOTHING " +
+      "unless every op is valid; then run the ops in order, stopping at " +
+      "the first failure.",
+  ),
+  requireReady: z.boolean().default(true).describe(
+    "Apply the full Definition of Ready to every create, whatever its " +
+      "bucket (a create op's own requireReady overrides it).",
+  ),
+  maxOps: z.number().int().min(1).max(500).default(60).describe(
+    "Refuse a plan with more ops than this.",
+  ),
+  projectId: ProjectIdOverride,
+});
+type ApplyPlanArgs = z.infer<typeof ApplyPlanArgsSchema>;
 
 // ============================================================================
 // Execution context
@@ -2165,21 +2301,30 @@ async function guardWrite(
   task: Record<string, unknown>,
   force: boolean,
 ): Promise<void> {
+  const problem = await guardProblem(g, ctx, task, force);
+  if (problem !== null) throw new Error(problem);
+}
+
+/** guardWrite's check without the throw: the refusal message, or null. */
+async function guardProblem(
+  g: GlobalArgs,
+  ctx: ExecCtx,
+  task: { id?: unknown; done?: unknown; updated?: unknown },
+  force: boolean,
+): Promise<string | null> {
   const id = task.id;
   if (task.done === true) {
-    throw new Error(`Task ${id} is done; not touching a done card.`);
+    return `Task ${id} is done; not touching a done card.`;
   }
   const minutes = g.policy.recentEditMinutes;
-  if (force || minutes === 0 || typeof task.updated !== "string") return;
+  if (force || minutes === 0 || typeof task.updated !== "string") return null;
   const age = Date.now() - Date.parse(task.updated);
-  if (!Number.isFinite(age) || age >= minutes * 60_000) return;
+  if (!Number.isFinite(age) || age >= minutes * 60_000) return null;
   const ours = await ctx.readResource?.(`task-${id}`).catch(() => null);
-  if (ours && ours.updated === task.updated) return;
-  throw new Error(
-    `Task ${id} was updated ${task.updated} (less than ${minutes} min ago) ` +
-      `by something other than this model; someone may be editing it. ` +
-      `Pass force: true to write anyway.`,
-  );
+  if (ours && ours.updated === task.updated) return null;
+  return `Task ${id} was updated ${task.updated} (less than ${minutes} min ago) ` +
+    `by something other than this model; someone may be editing it. ` +
+    `Pass force: true to write anyway.`;
 }
 
 /** Where a card sits now; throws when it is not on the view at all. */
@@ -2580,6 +2725,510 @@ async function reorder(
 }
 
 // ============================================================================
+// apply_plan — validate a batch against the live board, then run it
+// ============================================================================
+
+/** A card as the plan will have left it after the ops before this one. */
+interface ProjectedCard extends CardState {
+  id: number;
+  bucket: string;
+  done: boolean;
+  updated: string;
+  /** Index of the op that closes it, once one has. */
+  closedBy: number | null;
+  /** Whether the recent-edit guard has already been checked in this plan. */
+  guarded: boolean;
+}
+
+interface ValidatedOp {
+  index: number;
+  op: PlanOp;
+  taskId: number | null;
+  title: string | null;
+  problems: string[];
+  /** A create skipped because its title exists (duplicateTitle: skip). */
+  skip: boolean;
+}
+
+/**
+ * Phase 1: check every op against one read of the board (and, when any op
+ * names labels, one read of the labels), simulating the ops in order so
+ * that each is judged on the state the earlier ones leave. Collects every
+ * problem rather than stopping at the first. Reads only.
+ */
+async function validatePlan(
+  g: GlobalArgs,
+  ctx: ExecCtx,
+  args: ApplyPlanArgs,
+  board: BoardBucket[],
+): Promise<{ ops: ValidatedOp[]; planProblems: string[] }> {
+  const planProblems: string[] = [];
+  if (args.ops.length > args.maxOps) {
+    planProblems.push(
+      `plan has ${args.ops.length} ops, more than maxOps ${args.maxOps}`,
+    );
+  }
+
+  const bucketsByName = new Map(
+    board.map((b) => [b.title.toLowerCase(), b.title]),
+  );
+  const bucketList = board.map((b) => `"${b.title}"`).join(", ");
+  const cards = new Map<number, ProjectedCard>();
+  for (const b of board) {
+    const inDone = roleOf(b.title, g.bucketRoles) === "done";
+    for (const t of b.tasks) {
+      cards.set(t.id, {
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        labels: [...t.labels],
+        priority: t.priority,
+        dueDate: t.dueDate,
+        bucket: b.title,
+        done: t.done || inDone,
+        updated: t.updated,
+        closedBy: null,
+        guarded: false,
+      });
+    }
+  }
+  const needsLabels = args.ops.some((o) =>
+    (o.op === "create" && o.labels.length > 0) || o.op === "labels"
+  );
+  const known = needsLabels ? await fetchAllLabels(g) : new Map();
+  const unknownLabels = (names: string[]) =>
+    names.filter((n) => !known.has(n.toLowerCase()));
+  const plannedTitles: Array<{ index: number; title: string }> = [];
+
+  const out: ValidatedOp[] = [];
+  for (const [index, op] of args.ops.entries()) {
+    const problems: string[] = [];
+    const v: ValidatedOp = {
+      index,
+      op,
+      taskId: op.op === "create" ? null : op.taskId,
+      title: op.op === "create" ? op.title : null,
+      problems,
+      skip: false,
+    };
+    out.push(v);
+
+    if (op.op === "create") {
+      const bucketName = op.bucketName ?? g.defaultBucketName;
+      let bucket: string | null = null;
+      if (bucketName) {
+        bucket = bucketsByName.get(bucketName.toLowerCase()) ?? null;
+        if (bucket === null) {
+          problems.push(
+            `unknown bucket "${bucketName}"; available: ${bucketList}`,
+          );
+        }
+      }
+      const missing = unknownLabels(op.labels);
+      if (missing.length) {
+        problems.push(`unknown label(s): ${missing.join(", ")}`);
+      }
+      const due = op.dueDate?.trim() ? op.dueDate.trim() : null;
+      if (due !== null && !Number.isFinite(Date.parse(due))) {
+        problems.push(`dueDate is not a parseable instant: ${op.dueDate}`);
+      }
+      const labels = op.labels.map((n) =>
+        known.get(n.toLowerCase())?.title ?? n
+      );
+      for (
+        const p of readinessProblems(
+          {
+            title: op.title,
+            description: op.description ?? "",
+            labels,
+            priority: op.priority ?? 0,
+            dueDate: due,
+          },
+          bucket ? roleOf(bucket, g.bucketRoles) : "other",
+          g.policy,
+          {
+            intent: "create",
+            requireReady: op.requireReady ?? args.requireReady,
+          },
+        )
+      ) problems.push(`${p.rule} (${p.detail})`);
+      if (op.duplicateTitle !== "allow") {
+        const open = [...cards.values()].find((c) =>
+          !c.done && c.closedBy === null && sameTitle(c.title, op.title)
+        );
+        const earlier = plannedTitles.find((t) => sameTitle(t.title, op.title));
+        if (earlier) {
+          problems.push(
+            `duplicates the title of op #${earlier.index} in this plan`,
+          );
+        } else if (open && op.duplicateTitle === "refuse") {
+          problems.push(`open task ${open.id} already has this title`);
+        } else if (open) {
+          v.skip = true;
+          v.taskId = open.id;
+        }
+      }
+      if (!v.skip) plannedTitles.push({ index, title: op.title });
+      continue;
+    }
+
+    // Every other op targets an existing card.
+    const card = cards.get(op.taskId);
+    if (!card) {
+      problems.push(`task ${op.taskId} is not on the board`);
+      continue;
+    }
+    v.title = card.title;
+    if (card.closedBy !== null) {
+      problems.push(`task ${card.id} is closed by op #${card.closedBy} first`);
+      continue;
+    }
+
+    if (op.op === "close") {
+      if (!op.humanInstructed) {
+        problems.push("close needs humanInstructed: true on the op");
+      }
+      card.closedBy = index;
+      continue;
+    }
+
+    // update / labels / move / due: the same guard as the single methods,
+    // checked against the board once per card (later ops on the same card
+    // run after this plan's own write, which the guard exempts).
+    if (card.done) {
+      problems.push(`task ${card.id} is done; not touching a done card`);
+      continue;
+    }
+    if (!card.guarded) {
+      const guard = await guardProblem(g, ctx, card, op.force);
+      if (guard !== null) problems.push(guard);
+      card.guarded = true;
+    }
+
+    if (op.op === "update") {
+      if (
+        op.title === undefined && op.description === undefined &&
+        op.priority === undefined
+      ) {
+        problems.push(
+          "update needs at least one of title, description, priority",
+        );
+      }
+      if (op.title !== undefined && op.title.trim() === "") {
+        problems.push("title must not be empty");
+      }
+      if (op.description !== undefined && textLength(op.description) === 0) {
+        problems.push("refusing to write an empty description");
+      }
+      if (op.title !== undefined) card.title = op.title;
+      if (op.description !== undefined) card.description = op.description;
+      if (op.priority !== undefined) card.priority = op.priority;
+    } else if (op.op === "labels") {
+      if (op.add.length + op.remove.length === 0) {
+        problems.push("labels needs at least one label in add or remove");
+      }
+      const adding = new Set(op.add.map((n) => n.toLowerCase()));
+      const both = op.remove.filter((n) => adding.has(n.toLowerCase()));
+      if (both.length) {
+        problems.push(`label(s) in both add and remove: ${both.join(", ")}`);
+      }
+      const missing = unknownLabels([...op.add, ...op.remove]);
+      if (missing.length) {
+        problems.push(`unknown label(s): ${missing.join(", ")}`);
+      }
+      const removing = new Set(op.remove.map((n) => n.toLowerCase()));
+      const kept = card.labels.filter((l) => !removing.has(l.toLowerCase()));
+      for (const n of op.add) {
+        const t = known.get(n.toLowerCase())?.title ?? n;
+        if (!kept.some((l) => l.toLowerCase() === t.toLowerCase())) {
+          kept.push(t);
+        }
+      }
+      card.labels = kept;
+    } else if (op.op === "move") {
+      const target = bucketsByName.get(op.bucketName.toLowerCase());
+      if (target === undefined) {
+        problems.push(
+          `unknown bucket "${op.bucketName}"; available: ${bucketList}`,
+        );
+        continue;
+      }
+      const role = roleOf(target, g.bucketRoles);
+      if (role === "done") {
+        problems.push(
+          `refusing to move into "${target}": use a close op, which needs ` +
+            `humanInstructed: true`,
+        );
+        continue;
+      }
+      if (target !== card.bucket && !op.force) {
+        const ps = readinessProblems(card, role, g.policy, { intent: "move" });
+        if (ps.length) {
+          const later = args.ops.slice(index + 1).findIndex((o) =>
+            o.op !== "create" && o.op !== "close" && o.taskId === card.id
+          );
+          problems.push(
+            `task ${card.id} is not ready for "${target}": ` +
+              formatProblems(ps) +
+              (later >= 0
+                ? ` (op #${index + 1 + later} changes this card later; ` +
+                  `put the move after it)`
+                : ""),
+          );
+        }
+      }
+      card.bucket = target;
+    } else if (op.op === "due") {
+      const due = op.dueDate?.trim() ? op.dueDate.trim() : null;
+      if (due !== null && !Number.isFinite(Date.parse(due))) {
+        problems.push(`dueDate is not a parseable instant: ${op.dueDate}`);
+      }
+      if (
+        due === null && !op.force &&
+        roleOf(card.bucket, g.bucketRoles) === "waiting"
+      ) {
+        problems.push(
+          `refusing to clear the due date of task ${card.id} while it is in ` +
+            `"${card.bucket}": a waiting card needs one`,
+        );
+      }
+      card.dueDate = due;
+    }
+  }
+  return { ops: out, planProblems };
+}
+
+/**
+ * Validate a batch of card operations against the live board and, with
+ * apply: true and no problems at all, run them in order through the same
+ * internals as the single methods (so every write is read back and
+ * recorded as task-<id>, and the recent-edit guard sees them as ours).
+ * Always records the outcome as the planResult resource `plan-<project>`.
+ */
+async function applyPlan(
+  args: ApplyPlanArgs,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const plannedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+
+  const { ops, planProblems } = await validatePlan(g, ctx, args, board);
+  const problems: PlanResult["problems"] = [
+    ...planProblems.map((problem) => ({
+      index: null,
+      op: null,
+      taskId: null,
+      problem,
+    })),
+    ...ops.flatMap((v) =>
+      v.problems.map((problem) => ({
+        index: v.index,
+        op: v.op.op,
+        taskId: v.taskId,
+        problem,
+      }))
+    ),
+  ];
+  const valid = problems.length === 0;
+  const results: PlanResult["ops"] = ops.map((v) => ({
+    index: v.index,
+    op: v.op.op,
+    taskId: v.taskId,
+    title: v.title,
+    status: v.problems.length ? "invalid" : v.skip ? "skip" : "ok",
+    problems: v.problems,
+  }));
+
+  const handles: unknown[] = [];
+  let outcome: PlanResult["outcome"] = args.apply
+    ? (valid ? "applied" : "refused")
+    : "dry-run";
+  let failure: string | null = null;
+
+  if (args.apply && valid) {
+    // Capture what each single-method run records, to learn created ids.
+    let lastTask: Record<string, unknown> | null = null;
+    const runCtx: ExecCtx = {
+      ...ctx,
+      writeResource: async (spec, name, payload) => {
+        if (spec === "vikunjaTask") {
+          lastTask = payload as Record<string, unknown>;
+        }
+        const h = await ctx.writeResource(spec, name, payload);
+        handles.push(h);
+        return h;
+      },
+    };
+    for (const [i, v] of ops.entries()) {
+      if (v.skip) continue;
+      const op = v.op;
+      lastTask = null;
+      try {
+        await runOp(op, projectId, args, runCtx);
+        results[i].status = "done";
+        const got = lastTask as Record<string, unknown> | null;
+        if (op.op === "create" && got && typeof got.id === "number") {
+          results[i].taskId = got.id;
+        }
+      } catch (e) {
+        failure = e instanceof Error ? e.message : String(e);
+        results[i].status = "failed";
+        results[i].error = failure;
+        for (const later of results.slice(i + 1)) {
+          if (later.status !== "skip") later.status = "not-run";
+        }
+        outcome = "failed";
+        break;
+      }
+    }
+  }
+
+  const count = (st: PlanResult["ops"][number]["status"]) =>
+    results.filter((r) => r.status === st).length;
+  const result = PlanResultSchema.parse({
+    projectId,
+    viewId,
+    plannedAt,
+    outcome,
+    valid,
+    counts: {
+      ops: results.length,
+      problems: problems.length,
+      done: count("done"),
+      failed: count("failed"),
+      notRun: count("not-run"),
+      skipped: count("skip"),
+    },
+    problems,
+    ops: results,
+  });
+  handles.push(
+    await ctx.writeResource("planResult", `plan-${projectId}`, result),
+  );
+
+  const listed = problems.map((p) =>
+    `${p.index === null ? "plan" : `op #${p.index} (${p.op}`}` +
+    `${p.taskId !== null ? ` task ${p.taskId}` : ""}` +
+    `${p.index === null ? "" : ")"}: ${p.problem}`
+  );
+  if (outcome === "refused") {
+    throw new Error(
+      `apply_plan wrote nothing: ${problems.length} problem(s) —\n` +
+        listed.join("\n"),
+    );
+  }
+  if (outcome === "failed") {
+    const ids = (st: string) =>
+      results.filter((r) => r.status === st).map((r) => `#${r.index}`)
+        .join(", ") || "none";
+    const at = results.find((r) => r.status === "failed")!;
+    throw new Error(
+      `apply_plan stopped at op #${at.index} (${at.op}): ${failure}\n` +
+        `done: ${ids("done")}; failed: #${at.index}; not run: ` +
+        `${ids("not-run")}`,
+    );
+  }
+  if (!valid) {
+    for (const line of listed) ctx.logger?.warning(line);
+  }
+  ctx.logger?.info(
+    `apply_plan ${outcome}: ${results.length} op(s), ` +
+      `${problems.length} problem(s), ${count("done")} done, ` +
+      `${count("skip")} skipped`,
+  );
+  return { dataHandles: handles };
+}
+
+/** Run one plan op through the matching single method. */
+async function runOp(
+  op: PlanOp,
+  projectId: number,
+  args: ApplyPlanArgs,
+  ctx: ExecCtx,
+): Promise<void> {
+  switch (op.op) {
+    case "create":
+      await newTask(
+        NewTaskArgsSchema.parse({
+          title: op.title,
+          projectId,
+          description: op.description,
+          labels: op.labels,
+          priority: op.priority,
+          dueDate: op.dueDate,
+          bucketName: op.bucketName,
+          duplicateTitle: op.duplicateTitle,
+          requireReady: op.requireReady ?? args.requireReady,
+        }),
+        ctx,
+      );
+      return;
+    case "update":
+      await updateTask(
+        UpdateTaskArgsSchema.parse({
+          taskId: op.taskId,
+          title: op.title,
+          description: op.description,
+          priority: op.priority,
+          projectId,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "labels":
+      await setLabels(
+        SetLabelsArgsSchema.parse({
+          taskId: op.taskId,
+          add: op.add,
+          remove: op.remove,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "move":
+      await moveTask(
+        MoveTaskArgsSchema.parse({
+          taskId: op.taskId,
+          bucketName: op.bucketName,
+          projectId,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "due":
+      await setDueDate(
+        SetDueDateArgsSchema.parse({
+          taskId: op.taskId,
+          dueDate: op.dueDate ?? "",
+          projectId,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "close":
+      await closeTask(
+        CloseTaskArgsSchema.parse({
+          taskId: op.taskId,
+          humanInstructed: op.humanInstructed,
+          projectId,
+        }),
+        ctx,
+      );
+      return;
+  }
+}
+
+// ============================================================================
 // Model
 // ============================================================================
 
@@ -2716,6 +3365,14 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
+    planResult: {
+      description:
+        "One apply_plan run: the outcome (dry-run / refused / applied / " +
+        "failed), every validation problem, and each op's status.",
+      schema: PlanResultSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
     boardSnapshot: {
       description:
         "Every not-done card on a board with its bucket, role, labels, " +
@@ -2830,6 +3487,21 @@ export const model = {
         "closing a card is a person's decision.",
       arguments: CloseTaskArgsSchema,
       execute: closeTask,
+    },
+    apply_plan: {
+      description:
+        "Batch card writes in one run. Validates EVERY op (create, update, " +
+        "labels, move, due, close) against one read of the board and the " +
+        "labels — unknown or done cards, the recent-edit guard, unknown " +
+        "labels or buckets, readiness for creates and moves (judged on the " +
+        "state earlier ops leave), duplicate titles on the board or within " +
+        "the plan, ops after a close, close without humanInstructed — and " +
+        "collects every problem. Dry run by default: writes only the " +
+        "planResult resource. With apply: true it writes nothing unless " +
+        "there are no problems, then runs the ops in order through the " +
+        "single methods (each read back), stopping at the first failure.",
+      arguments: ApplyPlanArgsSchema,
+      execute: applyPlan,
     },
     board: {
       description:
