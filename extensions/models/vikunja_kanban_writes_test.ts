@@ -54,6 +54,9 @@ class FakeVikunja {
   /** Fields a PUT /projects/{id}/tasks (create) silently drops. */
   dropOnCreate: string[] = [];
   writes: string[] = [];
+  /** Every log call a method made, for the structured-logging test. */
+  logs: Array<{ level: string; msg: string; props: Record<string, unknown> }> =
+    [];
 
   seed(over: Partial<Task> & { bucket?: number; labelIds?: number[] } = {}) {
     const id = this.nextId++;
@@ -225,6 +228,12 @@ async function withFake<T>(
       return Promise.resolve({ name });
     },
     readResource: (name: string) => Promise.resolve(store.get(name) ?? null),
+    logger: {
+      info: (msg: string, props?: Record<string, unknown>) =>
+        fake.logs.push({ level: "info", msg, props: props ?? {} }),
+      warning: (msg: string, props?: Record<string, unknown>) =>
+        fake.logs.push({ level: "warning", msg, props: props ?? {} }),
+    },
   };
   // async, so a schema refusal from parse() rejects like a runtime one.
   const run = async (name: MethodName, args: Record<string, unknown>) => {
@@ -1177,4 +1186,53 @@ Deno.test("apply_plan: maxOps cap, and duplicateTitle skip leaves the op out", a
     assertEquals(r.ops[0].taskId, existing);
   });
   assertEquals(f.writes, []);
+});
+
+// ------------------------------------------------------------- logging
+
+Deno.test("every method logs its start, and every message is a constant template", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed({ title: "Alpha card" });
+  const b = f.seed({ title: "Beta card", bucket: 11 });
+  const methods: Array<[MethodName, Record<string, unknown>]> = [
+    ["new_task", { title: "Gamma card", labels: ["storage"] }],
+    ["new_task", { title: "alpha CARD" }], // duplicate skip
+    ["get_task", { taskId: a }],
+    ["update_task", { taskId: a, priority: 4 }],
+    ["update_task", { taskId: a, priority: 4 }], // no change
+    ["set_labels", { taskId: a, add: ["automation"] }],
+    ["move_task", { taskId: a, bucketName: "Doing" }],
+    ["move_task", { taskId: a, bucketName: "Doing" }], // already there
+    ["set_due_date", { taskId: a, dueDate: "2026-11-04T17:00:00Z" }],
+    ["board", {}],
+    ["apply_plan", { ops: [{ op: "labels", taskId: b, add: ["storag"] }] }],
+    ["close_task", { taskId: a, humanInstructed: true }],
+    ["list_recent", {}],
+    ["audit", {}],
+    ["reorder", {}],
+    ["due_report", { now: "2026-09-27T12:00:00Z" }],
+  ];
+  await withFake(f, async (run) => {
+    for (const [name, args] of methods) {
+      const before = f.logs.length;
+      await run(name, args);
+      const mine = f.logs.slice(before);
+      assert(
+        mine.some((l) => l.level === "info" && l.props.method === name),
+        `${name} logged no start line`,
+      );
+    }
+  });
+  const ids = [...f.tasks.keys()].map(String);
+  for (const { msg, props } of f.logs) {
+    // Every placeholder has a value, and no value was pasted into the text.
+    for (const [, key] of msg.matchAll(/\{(\w+)\}/g)) {
+      assert(key in props, `"${msg}" has no value for {${key}}`);
+    }
+    assert(!/\d/.test(msg), `"${msg}" has a number in the message text`);
+    for (const id of ids) {
+      assert(!msg.includes(id), `"${msg}" interpolates task id ${id}`);
+    }
+  }
+  assert(f.logs.length >= methods.length * 2);
 });

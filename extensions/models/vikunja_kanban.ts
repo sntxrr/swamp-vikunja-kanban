@@ -1171,10 +1171,13 @@ async function newTask(
           (e instanceof Error ? e.message : String(e)),
       );
     }
-    ctx.logger?.info(
-      `Placed task ${taskId} into bucket "${target.bucketTitle}"`,
-      { projectId, viewId: target.viewId, bucketId: target.bucketId },
-    );
+    ctx.logger?.info("Placed task {taskId} into bucket {bucket}", {
+      taskId,
+      bucket: target.bucketTitle,
+      projectId,
+      viewId: target.viewId,
+      bucketId: target.bucketId,
+    });
   }
 
   // Full read-back: HTTP 200 proves nothing.
@@ -1210,7 +1213,8 @@ async function newTask(
         `${errors.join("; ")}.`,
     );
   }
-  ctx.logger?.info(`Vikunja task created: ${taskId}`, {
+  ctx.logger?.info("Vikunja task created: {taskId}", {
+    taskId,
     title: args.title,
     projectId,
     bucket: target?.bucketTitle ?? null,
@@ -1346,7 +1350,10 @@ async function listRecent(
       fetchedAt,
     }),
   );
-  ctx.logger?.info(`Fetched ${ids.length} recent Vikunja tasks`);
+  ctx.logger?.info("Fetched {count} recent Vikunja tasks", {
+    count: ids.length,
+    projectId,
+  });
   return { dataHandles: handles };
 }
 
@@ -1939,11 +1946,17 @@ async function audit(
     report,
   );
   ctx.logger?.info(
-    `Audited project ${projectId}: ${
-      buckets.reduce((n, b) => n + b.count, 0)
-    } cards, ` +
-      `${findings.length} findings, ready ${ready.passing}/${ready.total}`,
-    { bySeverity, byRule },
+    "Audited project {projectId}: {cards} cards, {findings} findings, " +
+      "ready {readyPassing}/{readyTotal}",
+    {
+      projectId,
+      cards: buckets.reduce((n, b) => n + b.count, 0),
+      findings: findings.length,
+      readyPassing: ready.passing,
+      readyTotal: ready.total,
+      bySeverity,
+      byRule,
+    },
   );
   return { dataHandles: [handle] };
 }
@@ -2087,9 +2100,16 @@ async function dueReport(
     report,
   );
   ctx.logger?.info(
-    `Due report for project ${projectId}: ${report.counts.overdue} overdue, ` +
-      `${report.counts.dueToday} due today, ${report.counts.upcoming} upcoming`,
-    { asOf: report.asOf, lookaheadDays: args.lookaheadDays },
+    "Due report for project {projectId}: {overdue} overdue, {dueToday} due " +
+      "today, {upcoming} upcoming",
+    {
+      projectId,
+      overdue: report.counts.overdue,
+      dueToday: report.counts.dueToday,
+      upcoming: report.counts.upcoming,
+      asOf: report.asOf,
+      lookaheadDays: args.lookaheadDays,
+    },
   );
   return { dataHandles: [handle] };
 }
@@ -2156,8 +2176,12 @@ async function boardMethod(
     snapshot,
   );
   ctx.logger?.info(
-    `Board of project ${projectId}: ${snapshot.total} open cards in ` +
-      `${snapshot.buckets.length} buckets`,
+    "Board of project {projectId}: {cards} open cards in {buckets} buckets",
+    {
+      projectId,
+      cards: snapshot.total,
+      buckets: snapshot.buckets.length,
+    },
   );
   return { dataHandles: [handle] };
 }
@@ -2188,7 +2212,10 @@ async function getTask(
         : { title, role: roleOf(title, g.bucketRoles) },
     }, fetchedAt),
   );
-  ctx.logger?.info(`Task ${args.taskId}: in "${title}"`);
+  ctx.logger?.info("Task {taskId}: in {bucket}", {
+    taskId: args.taskId,
+    bucket: title,
+  });
   return { dataHandles: [handle] };
 }
 
@@ -2251,7 +2278,10 @@ async function setDueDate(
     (before !== null && wanted !== null &&
       Date.parse(before) === Date.parse(wanted))
   ) {
-    ctx.logger?.info(`Task ${args.taskId}: due date already ${wanted}`);
+    ctx.logger?.info("Task {taskId}: due date already {dueDate}", {
+      taskId: args.taskId,
+      dueDate: wanted,
+    });
   } else {
     await vreq(g, "POST", `/tasks/${args.taskId}`, {
       body: { ...full, due_date: wanted },
@@ -2285,7 +2315,10 @@ async function setDueDate(
     `task-${args.taskId}`,
     toVikunjaTask(after, fetchedAt),
   );
-  ctx.logger?.info(`Task ${args.taskId}: due date ${before} -> ${got}`, {
+  ctx.logger?.info("Task {taskId}: due date {before} -> {after}", {
+    taskId: args.taskId,
+    before,
+    after: got,
     bucket: bucketAfter,
   });
   return { dataHandles: [handle] };
@@ -2376,7 +2409,7 @@ async function updateTask(
   const changed = Object.keys(wanted).filter((k) => full[k] !== wanted[k]);
 
   if (changed.length === 0) {
-    ctx.logger?.info(`Task ${args.taskId}: no change`);
+    ctx.logger?.info("Task {taskId}: no change", { taskId: args.taskId });
   } else {
     await vreq(g, "POST", `/tasks/${args.taskId}`, {
       body: { ...full, ...wanted },
@@ -2403,8 +2436,8 @@ async function updateTask(
       );
     }
     ctx.logger?.warning(
-      `Task ${args.taskId}: the write moved the card out of ` +
-        `"${bucketBefore}"; moved it back`,
+      "Task {taskId}: the write moved the card out of {bucket}; moved it back",
+      { taskId: args.taskId, bucket: bucketBefore, movedTo: bucketAfter },
     );
   }
 
@@ -2414,12 +2447,11 @@ async function updateTask(
     `task-${args.taskId}`,
     toVikunjaTask(final, fetchedAt),
   );
-  ctx.logger?.info(
-    `Task ${args.taskId}: updated ${changed.join(", ") || "nothing"}`,
-    {
-      bucket: bucketBefore,
-    },
-  );
+  ctx.logger?.info("Task {taskId}: updated {fields}", {
+    taskId: args.taskId,
+    fields: changed.join(", ") || "nothing",
+    bucket: bucketBefore,
+  });
   return { dataHandles: [handle] };
 }
 
@@ -2476,9 +2508,10 @@ async function setLabels(
     `task-${args.taskId}`,
     toVikunjaTask(after, fetchedAt),
   );
-  ctx.logger?.info(
-    `Task ${args.taskId}: labels = ${[...now].sort().join(", ")}`,
-  );
+  ctx.logger?.info("Task {taskId}: labels = {labels}", {
+    taskId: args.taskId,
+    labels: [...now].sort().join(", "),
+  });
   return { dataHandles: [handle] };
 }
 
@@ -2507,7 +2540,10 @@ async function moveTask(
   await guardWrite(g, ctx, task, args.force);
   const from = await requireBucketOf(g, projectId, viewId, args.taskId);
   if (from.toLowerCase() === target.title.toLowerCase()) {
-    ctx.logger?.info(`Task ${args.taskId}: already in "${from}"`);
+    ctx.logger?.info("Task {taskId}: already in {bucket}", {
+      taskId: args.taskId,
+      bucket: from,
+    });
   } else {
     // The same rules audit applies to the column: a card is only promoted
     // into the ready column when it passes the Definition of Ready, and
@@ -2533,7 +2569,11 @@ async function moveTask(
           `"${target.title}".`,
       );
     }
-    ctx.logger?.info(`Task ${args.taskId}: "${from}" -> "${target.title}"`);
+    ctx.logger?.info("Task {taskId}: {from} -> {to}", {
+      taskId: args.taskId,
+      from,
+      to: target.title,
+    });
   }
 
   const final = await readTask(g, args.taskId);
@@ -2576,7 +2616,7 @@ async function closeTask(
 
   const full = await readTask(g, args.taskId);
   if (full.done === true) {
-    ctx.logger?.info(`Task ${args.taskId}: already done`);
+    ctx.logger?.info("Task {taskId}: already done", { taskId: args.taskId });
   } else {
     await vreq(g, "POST", `/tasks/${args.taskId}`, {
       body: { ...full, done: true },
@@ -2613,7 +2653,10 @@ async function closeTask(
       },
     }, fetchedAt),
   );
-  ctx.logger?.info(`Task ${args.taskId}: closed (done, "${doneBucket.title}")`);
+  ctx.logger?.info("Task {taskId}: closed (done, {bucket})", {
+    taskId: args.taskId,
+    bucket: doneBucket.title,
+  });
   return { dataHandles: [handle] };
 }
 
@@ -2687,10 +2730,12 @@ async function reorder(
             position: move.position,
           },
         });
-        ctx.logger?.info(
-          `Moved #${move.task.id} to slot ${move.index} in "${bucketTitle}"`,
-          { position: move.position },
-        );
+        ctx.logger?.info("Moved #{taskId} to slot {slot} in {bucket}", {
+          taskId: move.task.id,
+          slot: move.index,
+          bucket: bucketTitle,
+          position: move.position,
+        });
         // Vikunja may not store the exact number sent — always re-read.
         board = await fetchBoard(g, projectId, viewId);
       }
@@ -2719,11 +2764,18 @@ async function reorder(
     `reorder-${projectId}`,
     plan,
   );
-  ctx.logger?.info(
-    args.apply
-      ? `Reordered project ${projectId}: ${iterations} moves, converged=${converged}`
-      : `Dry run for project ${projectId}: ${moves.length} card(s) out of place (apply: true to fix)`,
-  );
+  if (args.apply) {
+    ctx.logger?.info(
+      "Reordered project {projectId}: {moves} moves, converged={converged}",
+      { projectId, moves: iterations, converged },
+    );
+  } else {
+    ctx.logger?.info(
+      "Dry run for project {projectId}: {outOfPlace} card(s) out of place " +
+        "(apply: true to fix)",
+      { projectId, outOfPlace: moves.length },
+    );
+  }
   return { dataHandles: [handle] };
 }
 
@@ -3138,12 +3190,26 @@ async function applyPlan(
     );
   }
   if (!valid) {
-    for (const line of listed) ctx.logger?.warning(line);
+    for (const p of problems) {
+      ctx.logger?.warning("Plan problem at {where}: {problem}", {
+        where: p.index === null ? "plan" : `op #${p.index} (${p.op})`,
+        op: p.op,
+        index: p.index,
+        taskId: p.taskId,
+        problem: p.problem,
+      });
+    }
   }
   ctx.logger?.info(
-    `apply_plan ${outcome}: ${results.length} op(s), ` +
-      `${problems.length} problem(s), ${count("done")} done, ` +
-      `${count("skip")} skipped`,
+    "apply_plan {outcome}: {ops} op(s), {problems} problem(s), {done} " +
+      "done, {skipped} skipped",
+    {
+      outcome,
+      ops: results.length,
+      problems: problems.length,
+      done: count("done"),
+      skipped: count("skip"),
+    },
   );
   return { dataHandles: handles };
 }
@@ -3235,10 +3301,31 @@ async function runOp(
 // Model
 // ============================================================================
 
+/**
+ * Wrap a method so it logs one start line: the method name plus the ids
+ * that say what it is about to touch. Never the arguments wholesale — a
+ * description can be long, and nothing here needs it in a log line.
+ */
+function logged<A>(
+  method: string,
+  execute: (args: A, ctx: ExecCtx) => Promise<{ dataHandles: unknown[] }>,
+): (args: A, ctx: ExecCtx) => Promise<{ dataHandles: unknown[] }> {
+  return (args, ctx) => {
+    const a = args as Record<string, unknown>;
+    const props: Record<string, unknown> = { method };
+    for (const k of ["taskId", "projectId", "bucketName", "apply"]) {
+      if (a[k] !== undefined) props[k] = a[k];
+    }
+    if (Array.isArray(a.ops)) props.ops = a.ops.length;
+    ctx.logger?.info("{method}: starting", props);
+    return execute(args, ctx);
+  };
+}
+
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.27.2",
+  version: "2026.09.27.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3348,6 +3435,17 @@ export const model = {
         "Existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.09.27.3",
+      description:
+        "Logging only: every log line is a constant message template with " +
+        'its values passed as structured properties (e.g. "Task {taskId}: ' +
+        'no change" with { taskId }), and every method logs one start ' +
+        "line naming the method and the task/project it targets. No " +
+        "behaviour, argument or resource changes; existing model " +
+        "attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     vikunjaTask: {
@@ -3413,7 +3511,7 @@ export const model = {
         "cards per role, WIP over the limit, and buckets out of order. " +
         "Writes a boardAudit resource; changes nothing.",
       arguments: AuditArgsSchema,
-      execute: audit,
+      execute: logged("audit", audit),
     },
     reorder: {
       description:
@@ -3424,7 +3522,7 @@ export const model = {
         "on write, so batch-assigned positions drift), failing loudly if " +
         "the board does not converge.",
       arguments: ReorderArgsSchema,
-      execute: reorder,
+      execute: logged("reorder", reorder),
     },
     due_report: {
       description:
@@ -3434,7 +3532,7 @@ export const model = {
         "Treat a card's due date as the day to look at it again; a daily " +
         "workflow gated on counts.actionable > 0 turns that into a nudge.",
       arguments: DueReportArgsSchema,
-      execute: dueReport,
+      execute: logged("due_report", dueReport),
     },
     set_due_date: {
       description:
@@ -3446,7 +3544,7 @@ export const model = {
         "policy.recentEditMinutes, and clearing the date of a waiting card, " +
         "unless force: true. Records the task as a vikunjaTask resource.",
       arguments: SetDueDateArgsSchema,
-      execute: setDueDate,
+      execute: logged("set_due_date", setDueDate),
     },
     new_task: {
       description:
@@ -3464,7 +3562,7 @@ export const model = {
         "priority, due date, labels and bucket; a mismatch is an error " +
         "naming the task id.",
       arguments: NewTaskArgsSchema,
-      execute: newTask,
+      execute: logged("new_task", newTask),
     },
     update_task: {
       description:
@@ -3476,7 +3574,7 @@ export const model = {
         "descriptions, and cards someone else updated within " +
         "policy.recentEditMinutes unless force: true.",
       arguments: UpdateTaskArgsSchema,
-      execute: updateTask,
+      execute: logged("update_task", updateTask),
     },
     set_labels: {
       description:
@@ -3486,7 +3584,7 @@ export const model = {
         "Reads the card back and asserts the result. Same done-card and " +
         "recent-edit guards as update_task.",
       arguments: SetLabelsArgsSchema,
-      execute: setLabels,
+      execute: logged("set_labels", setLabels),
     },
     move_task: {
       description:
@@ -3500,7 +3598,7 @@ export const model = {
         "field edits: a full-replace write can drop a card out of its " +
         "bucket.",
       arguments: MoveTaskArgsSchema,
-      execute: moveTask,
+      execute: logged("move_task", moveTask),
     },
     close_task: {
       description:
@@ -3508,7 +3606,7 @@ export const model = {
         "read both back. Only runs with humanInstructed: true, because " +
         "closing a card is a person's decision.",
       arguments: CloseTaskArgsSchema,
-      execute: closeTask,
+      execute: logged("close_task", closeTask),
     },
     apply_plan: {
       description:
@@ -3523,7 +3621,7 @@ export const model = {
         "there are no problems, then runs the ops in order through the " +
         "single methods (each read back), stopping at the first failure.",
       arguments: ApplyPlanArgsSchema,
-      execute: applyPlan,
+      execute: logged("apply_plan", applyPlan),
     },
     board: {
       description:
@@ -3532,14 +3630,14 @@ export const model = {
         "priority, due date, updated) as one boardSnapshot resource, read " +
         "page by page so no bucket is truncated.",
       arguments: BoardArgsSchema,
-      execute: boardMethod,
+      execute: logged("board", boardMethod),
     },
     get_task: {
       description:
         "Read-only: one card plus the bucket (and role) it sits in, " +
         "written as the vikunjaTask resource get-<id>.",
       arguments: GetTaskArgsSchema,
-      execute: getTask,
+      execute: logged("get_task", getTask),
     },
     list_recent: {
       description:
@@ -3547,7 +3645,7 @@ export const model = {
         "configured default, or a per-call projectId) and record each as " +
         "swamp data.",
       arguments: ListRecentArgsSchema,
-      execute: listRecent,
+      execute: logged("list_recent", listRecent),
     },
   },
 };
