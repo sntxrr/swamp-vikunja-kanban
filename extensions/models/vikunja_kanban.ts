@@ -3106,18 +3106,29 @@ async function applyPlan(
     : "dry-run";
   let failure: string | null = null;
 
+  // Records the single methods write, held back so each instance name is
+  // written once: swamp fails a run that writes one name twice, and a plan
+  // often has several ops on one card. The last write wins — it is the
+  // card's final state, which is what the recent-edit guard must see.
+  const pending = new Map<string, { spec: string; payload: unknown }>();
   if (args.apply && valid) {
     // Capture what each single-method run records, to learn created ids.
     let lastTask: Record<string, unknown> | null = null;
     const runCtx: ExecCtx = {
       ...ctx,
-      writeResource: async (spec, name, payload) => {
+      writeResource: (spec, name, payload) => {
         if (spec === "vikunjaTask") {
           lastTask = payload as Record<string, unknown>;
         }
-        const h = await ctx.writeResource(spec, name, payload);
-        handles.push(h);
-        return h;
+        pending.delete(name); // re-insert: keep write order for the flush
+        pending.set(name, { spec, payload });
+        return Promise.resolve({ pending: name });
+      },
+      // Within the run, the guard must see this plan's own earlier writes.
+      readResource: (name) => {
+        const p = pending.get(name);
+        if (p) return Promise.resolve(p.payload as Record<string, unknown>);
+        return ctx.readResource?.(name) ?? Promise.resolve(null);
       },
     };
     for (const [i, v] of ops.entries()) {
@@ -3142,6 +3153,12 @@ async function applyPlan(
         break;
       }
     }
+  }
+
+  // Flush on success and on a mid-run stop alike: every write that landed
+  // is recorded, so a follow-up edit to those cards counts as ours.
+  for (const [name, { spec, payload }] of pending) {
+    handles.push(await ctx.writeResource(spec, name, payload));
   }
 
   const count = (st: PlanResult["ops"][number]["status"]) =>
@@ -3325,7 +3342,7 @@ function logged<A>(
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.27.3",
+  version: "2026.09.27.4",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3444,6 +3461,18 @@ export const model = {
         "line naming the method and the task/project it targets. No " +
         "behaviour, argument or resource changes; existing model " +
         "attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.27.4",
+      description:
+        "apply_plan writes each vikunjaTask record once per run, with the " +
+        "card's final state, instead of once per op: swamp rejects a run " +
+        "that writes one instance name twice, so a plan with two ops on one " +
+        "card (update then move/close) exited 1 after every op had already " +
+        "landed. Records are also written when a run stops mid-way. No " +
+        "argument or resource changes; existing model attributes carry " +
+        "over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
