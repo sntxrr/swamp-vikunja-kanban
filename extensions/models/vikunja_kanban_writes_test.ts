@@ -224,6 +224,7 @@ async function withFake<T>(
       projectId: 5,
     },
     writeResource: (_spec: string, name: string, payload: unknown) => {
+      written.push(name);
       store.set(name, payload as Record<string, unknown>);
       return Promise.resolve({ name });
     },
@@ -236,10 +237,24 @@ async function withFake<T>(
     },
   };
   // async, so a schema refusal from parse() rejects like a runtime one.
+  // Like swamp: the writes land, then a run that wrote one instance name
+  // twice fails output validation.
+  let written: string[] = [];
   const run = async (name: MethodName, args: Record<string, unknown>) => {
     const method = model.methods[name];
+    written = [];
     // deno-lint-ignore no-explicit-any
-    return await (method.execute as any)(method.arguments.parse(args), ctx);
+    const out = await (method.execute as any)(
+      method.arguments.parse(args),
+      ctx,
+    );
+    const dup = written.find((n, i) => written.indexOf(n) !== i);
+    if (dup !== undefined) {
+      throw new Error(
+        `Data output validation failed: Duplicate data instance name '${dup}'`,
+      );
+    }
+    return out;
   };
   try {
     return await fn(run, store);
@@ -1151,6 +1166,9 @@ Deno.test("apply_plan stops at a mid-run failure and reports not-run ops", async
     assert(r.ops[1].error!.includes("description did not read back"));
     assertEquals(r.counts.done, 1);
     assertEquals(r.counts.notRun, 2);
+    // The op that landed before the stop is still recorded as ours.
+    assertStrictEquals(store.get(`task-${a}`)?.priority, 5);
+    assert(!store.has(`task-${b}`));
   });
   assertStrictEquals(f.tasks.get(a)!.priority, 5);
   assertEquals(labelTitles(f, c), ["automation"]);
@@ -1235,4 +1253,31 @@ Deno.test("every method logs its start, and every message is a constant template
     }
   }
   assert(f.logs.length >= methods.length * 2);
+});
+
+Deno.test("apply_plan with several ops on one card records each card once", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed({ title: "Stale report" });
+  const b = f.seed({ title: "Needs labels" });
+  await withFake(f, async (run, store) => {
+    // The live 2026-09-27 shape: update then close one card, and two
+    // writes then a move on another.
+    await run("apply_plan", {
+      apply: true,
+      ops: [
+        { op: "update", taskId: a, description: "<p>DISSOLVED. why</p>" },
+        { op: "close", taskId: a, humanInstructed: true },
+        { op: "labels", taskId: b, add: ["storage"] },
+        { op: "update", taskId: b, priority: 4 },
+        { op: "move", taskId: b, bucketName: "Doing" },
+      ],
+    });
+    assertEquals(planOf(store).outcome, "applied");
+    // task-<id> holds the LAST state, so the guard sees the final write.
+    assertStrictEquals(store.get(`task-${a}`)!.done, true);
+    assertStrictEquals(store.get(`task-${b}`)!.priority, 4);
+    assertEquals(bucketTitle(f, b), "Doing");
+    // A follow-up edit right away is recognised as ours.
+    await run("update_task", { taskId: b, priority: 5 });
+  });
 });
