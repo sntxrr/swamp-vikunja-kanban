@@ -20,11 +20,21 @@ interface Label {
 const OLD = "2026-09-01T00:00:00Z";
 
 class FakeVikunja {
+  // 120 labels, so GET /labels spans three pages of 50: the three named
+  // ones on page 1, "filler-004".."filler-120" after them.
   labels: Label[] = [
     { id: 1, title: "automation" },
     { id: 2, title: "tier-B" },
     { id: 3, title: "storage" },
+    ...Array.from({ length: 117 }, (_, i) => ({
+      id: i + 4,
+      title: `filler-${String(i + 4).padStart(3, "0")}`,
+    })),
   ];
+  /** Simulate a server that ignores `page` and always returns page 1. */
+  ignorePage = false;
+  /** Every GET, as "path?query", for asserting how lists were paged. */
+  reads: string[] = [];
   buckets = [
     { id: 10, title: "Backlog", position: 1 },
     { id: 11, title: "Next", position: 2 },
@@ -75,15 +85,27 @@ class FakeVikunja {
     t.updated = new Date(Date.now() + this.writes.length).toISOString();
   }
 
+  /** Vikunja-style paging: per_page clamped to max_items_per_page (50). */
+  page<T>(url: URL, items: T[]): T[] {
+    const per = Math.min(Number(url.searchParams.get("per_page") ?? 50), 50);
+    const page = this.ignorePage
+      ? 1
+      : Math.max(Number(url.searchParams.get("page") ?? 1), 1);
+    return items.slice((page - 1) * per, page * per);
+  }
+
   handle(method: string, url: URL, body: unknown): [number, unknown] {
     const path = url.pathname.replace(/^\/api\/v1/, "");
     let m: RegExpMatchArray | null;
     if (method !== "GET") this.writes.push(`${method} ${path}`);
+    else this.reads.push(`${path}${url.search}`);
 
     if (method === "GET" && path === "/info") {
       return [200, { max_items_per_page: 50 }];
     }
-    if (method === "GET" && path === "/labels") return [200, this.labels];
+    if (method === "GET" && path === "/labels") {
+      return [200, this.page(url, this.labels)];
+    }
     if (method === "GET" && path === "/projects/5/views") {
       return [200, [{ id: 20, view_kind: "kanban" }]];
     }
@@ -120,8 +142,11 @@ class FakeVikunja {
       const s = url.searchParams.get("s") ?? "";
       return [
         200,
-        [...this.tasks.keys()].map((id) => this.view(id)).filter((t) =>
-          String(t.title).includes(s)
+        this.page(
+          url,
+          [...this.tasks.keys()].map((id) => this.view(id)).filter((t) =>
+            String(t.title).includes(s)
+          ),
         ),
       ];
     }
@@ -247,6 +272,73 @@ Deno.test("new_task with an unknown label creates nothing", async () => {
   assertEquals(f.writes, []);
 });
 
+Deno.test("new_task attaches a label from beyond the first page", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run) => {
+    await run("new_task", {
+      title: "paged",
+      labels: ["filler-077", "Filler-120"],
+    });
+  });
+  assertEquals(labelTitles(f, 100), ["filler-077", "filler-120"]);
+  const labelReads = f.reads.filter((r) => r.startsWith("/labels"));
+  assertStrictEquals(labelReads.length, 3, labelReads.join("\n"));
+});
+
+Deno.test("an unknown label title still throws with all pages read, no writes", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed({ labelIds: [1] });
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () =>
+        run("new_task", { title: "x", labels: ["filler-099", "filler-999"] }),
+      Error,
+      "filler-999",
+    );
+    await assertRejects(
+      () => run("set_labels", { taskId: id, add: ["filler-121"] }),
+      Error,
+      "filler-121",
+    );
+  });
+  assertEquals(f.writes, []);
+  assertStrictEquals(f.tasks.size, 1);
+});
+
+Deno.test("label paging terminates when the server ignores page", async () => {
+  const f = new FakeVikunja();
+  f.ignorePage = true;
+  await withFake(f, async (run) => {
+    // Page 1 again adds nothing new, so the loop stops at page 2.
+    await run("new_task", { title: "p1", labels: ["automation"] });
+    await assertRejects(
+      () => run("new_task", { title: "p2", labels: ["filler-080"] }),
+      Error,
+      "filler-080",
+    );
+  });
+  assertStrictEquals(
+    f.reads.filter((r) => r.startsWith("/labels")).length,
+    4,
+    f.reads.join("\n"),
+  );
+  assertStrictEquals(f.tasks.size, 1);
+});
+
+Deno.test("skipIfTitleExists finds a duplicate beyond the first page", async () => {
+  const f = new FakeVikunja();
+  // 60 open cards whose titles contain the search term; the exact match is
+  // the last one, on page 2 of the search.
+  for (let i = 0; i < 60; i++) f.seed({ title: `shared prefix ${i}` });
+  const dupId = f.seed({ title: "shared prefix" });
+  await withFake(f, async (run, store) => {
+    await run("new_task", { title: "shared prefix", skipIfTitleExists: true });
+    assert(store.has(`task-${dupId}`), [...store.keys()].join(","));
+  });
+  assertEquals(f.writes, []);
+  assertStrictEquals(f.tasks.size, 61);
+});
+
 // ------------------------------------------------------------- update_task
 
 Deno.test("update_task changes only the named fields", async () => {
@@ -347,6 +439,28 @@ Deno.test("set_labels adds and removes by title, case-insensitively", async () =
   );
   assertEquals(labelTitles(f, id), ["automation", "tier-B"]);
   assert(!f.writes.some((w) => w.startsWith("POST /tasks")), "no body write");
+});
+
+Deno.test("set_labels adds and removes page-2+ titles with one label read", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed({ labelIds: [1, 110] });
+  await withFake(
+    f,
+    (run) =>
+      run("set_labels", {
+        taskId: id,
+        add: ["filler-060", "FILLER-101"],
+        remove: ["filler-110"],
+      }),
+  );
+  assertEquals(labelTitles(f, id), ["automation", "filler-060", "filler-101"]);
+  // 120 labels at 50 per page: pages 1-3 once, not twice (add + remove).
+  assertEquals(
+    f.reads.filter((r) => r.startsWith("/labels")).map((r) =>
+      new URLSearchParams(r.split("?")[1]).get("page")
+    ),
+    ["1", "2", "3"],
+  );
 });
 
 Deno.test("set_labels refuses unknown titles and add/remove overlap", async () => {

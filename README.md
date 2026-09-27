@@ -187,4 +187,4 @@ globalArguments:
 - Rate limiting: retries transparently on HTTP 429 (`maxRetries`, default 5), honoring `Retry-After`.
 - `POST /tasks/{id}` is a **full replace** in Vikunja. Every method that writes a task body (`update_task`, `set_due_date`, `close_task`) reads the whole task, merges, writes the whole object back, and re-reads.
 - Bucket moves use `POST /projects/{project}/views/{view}/buckets/{bucket}/tasks` (Vikunja ≥ 0.24 / v2.x).
-- Labels: titles are mapped to ids with `GET /labels`, then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written.
+- Labels: titles are mapped to ids by reading every page of `GET /labels` (the server caps a page at `max_items_per_page`), then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written.

@@ -615,25 +615,76 @@ interface LabelRef {
 }
 
 /**
- * Resolve label titles (case-insensitive) to their ids via GET /labels,
- * de-duplicated. Throws naming every unknown title and listing the known
- * ones. This model never creates labels.
+ * The server's page size from GET /info (`max_items_per_page`), or null when
+ * /info is unreadable. Vikunja clamps any larger `per_page` to this value.
  */
-async function resolveLabels(
+async function serverPageSize(g: GlobalArgs): Promise<number | null> {
+  const info = await vreq(g, "GET", "/info").catch(() => null) as
+    | Record<string, unknown>
+    | null;
+  return info && typeof info.max_items_per_page === "number" &&
+      info.max_items_per_page > 0
+    ? info.max_items_per_page
+    : null;
+}
+
+/**
+ * GET every page of a paginated list endpoint, de-duplicated by numeric id.
+ * Vikunja clamps `per_page` to `max_items_per_page` (50 by default), so one
+ * request silently truncates any longer list. Stops on a page that adds no
+ * new id (an empty page, or a server that ignores `page`), on a short page
+ * when the page size is known from /info, or after 100 pages.
+ */
+async function fetchAllPages(
   g: GlobalArgs,
-  names: string[],
-): Promise<LabelRef[]> {
-  if (names.length === 0) return [];
+  path: string,
+  search: Record<string, string> = {},
+): Promise<Array<Record<string, unknown>>> {
+  const known = await serverPageSize(g);
+  const perPage = known ?? 50;
+  const out: Array<Record<string, unknown>> = [];
+  const seen = new Set<number>();
+  for (let page = 1; page <= 100; page++) {
+    const raw = asArray(
+      await vreq(g, "GET", path, {
+        search: { ...search, page: String(page), per_page: String(perPage) },
+      }),
+    );
+    let grew = false;
+    for (const item of raw) {
+      if (typeof item.id !== "number" || seen.has(item.id)) continue;
+      seen.add(item.id);
+      out.push(item);
+      grew = true;
+    }
+    // A short page ends the list only when the page size is trusted: with
+    // the fallback, a server capped below 50 would look short on page 1.
+    if (!grew || (known !== null && raw.length < perPage)) break;
+  }
+  return out;
+}
+
+/** Every label visible to the token, keyed by lower-cased title. */
+async function fetchAllLabels(g: GlobalArgs): Promise<Map<string, LabelRef>> {
   const known = new Map<string, LabelRef>();
-  for (
-    const l of asArray(
-      await vreq(g, "GET", "/labels", { search: { per_page: "100" } }),
-    )
-  ) {
+  for (const l of await fetchAllPages(g, "/labels")) {
     if (typeof l.id === "number" && typeof l.title === "string") {
       known.set(l.title.toLowerCase(), { id: l.id, title: l.title });
     }
   }
+  return known;
+}
+
+/**
+ * Resolve label titles (case-insensitive) to their ids against `known`
+ * (from fetchAllLabels, which reads every page of GET /labels),
+ * de-duplicated. Throws naming every unknown title and listing the known
+ * ones. This model never creates labels.
+ */
+function resolveLabels(
+  known: Map<string, LabelRef>,
+  names: string[],
+): LabelRef[] {
   const out: LabelRef[] = [];
   const unknown: string[] = [];
   for (const name of names) {
@@ -759,11 +810,9 @@ async function newTask(
   const projectId = args.projectId ?? g.projectId;
 
   if (args.skipIfTitleExists) {
-    const existing = asArray(
-      await vreq(g, "GET", `/projects/${projectId}/tasks`, {
-        search: { s: args.title, per_page: "50" },
-      }),
-    );
+    const existing = await fetchAllPages(g, `/projects/${projectId}/tasks`, {
+      s: args.title,
+    });
     const dup = existing.find((t) =>
       typeof t.title === "string" &&
       t.title === args.title &&
@@ -802,10 +851,13 @@ async function newTask(
     }
   }
   // Labels too: a typo must not leave a half-labelled task behind.
-  const labels = await resolveLabels(g, [
+  const labelNames = [
     ...(args.label ? [args.label] : []),
     ...(args.labels ?? []),
-  ]);
+  ];
+  const labels = labelNames.length
+    ? resolveLabels(await fetchAllLabels(g), labelNames)
+    : [];
 
   const body: Record<string, unknown> = { title: args.title };
   if (args.description) body.description = args.description;
@@ -1762,8 +1814,10 @@ async function setLabels(
 ): Promise<{ dataHandles: unknown[] }> {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = new Date().toISOString();
-  const add = await resolveLabels(g, args.add);
-  const remove = await resolveLabels(g, args.remove);
+  // One read of every label page resolves both lists.
+  const known = await fetchAllLabels(g);
+  const add = resolveLabels(known, args.add);
+  const remove = resolveLabels(known, args.remove);
 
   const task = await readTask(g, args.taskId);
   await guardWrite(g, ctx, task, args.force);
@@ -2043,7 +2097,7 @@ async function reorder(
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.26.1",
+  version: "2026.09.27.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2121,6 +2175,17 @@ export const model = {
         "the task is created instead of being skipped with a warning, and " +
         "labels missing after the write are an error. Existing model " +
         "attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.27.1",
+      description:
+        "Label lookup now reads every page of GET /labels: the server caps " +
+        "a page at max_items_per_page (50 by default), so with more labels " +
+        "than that, new_task and set_labels reported labels beyond the " +
+        "first page as not found. set_labels reads the labels once for " +
+        "both add and remove. new_task's skipIfTitleExists lookup is paged " +
+        "the same way. Existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
