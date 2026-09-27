@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.09.27.2",
+  "reviewedAt": "2026-09-27T21:23:15Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No new credential fields. apiToken stays .meta({sensitive:true}) via vault reference; vreq errors carry method/path/status/body only. New methods (board, get_task, apply_plan) log counts, ids and titles, never the token."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "issue",
+      "note": "Follow-up, carried from 2026.09.27.1: completion logs use template-string interpolation rather than structured placeholders and there is no entry-level info log. apply_plan logs every validation problem as a warning on a dry run and a one-line outcome summary. No sensitive values logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "apply_plan: every op is validated against one board read before any write; apply:true with any problem throws 'wrote nothing' and a test asserts zero HTTP writes. At run time each op goes through its single method, which re-checks the recent-edit guard and readiness on live state, so a card edited between validation and apply stops the run instead of being overwritten. A mid-run failure throws naming done / failed / not-run ops after recording planResult. new_task/move_task refuse on readiness before writing; new_task's read-back mismatch records task-<id> then throws naming the created id."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "60 tests pass (34 at 2026.09.27.1). 19 new write-path tests fail against 2026.09.27.1 code (mutation control): per-bucket readiness on create and move, Doing refused on create, duplicate refuse/skip/allow case-insensitive, create fix-up and read-back, set_due_date guard, board size (120 cards < 200 KB), get_task naming, apply_plan dry run / all-or-nothing / ordered apply / projected state / mid-run stop / maxOps + skip. A 112-pair fixture x role test pins audit output to 2026.09.27.1. Added: a duplicate skip must not count as this model's write (failed before the fix)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "new_task duplicateTitle defaults to skip (as before) and to refuse inside a plan; a skip records get-<id>, not task-<id>, so it cannot vouch for someone else's edit. apply_plan is not transactional by design: it stops at the first failure and reports what ran; re-running validates against the new board, so done ops read as no-ops or duplicates. Follow-up: set_due_date still fails ('move it back by hand') rather than restoring the bucket if a full-replace write un-buckets the card; in a plan this stops the run loudly."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "issue",
+      "note": "Follow-up, pre-existing: fetchBoard stops after 100 pages without a truncated flag on boardAudit/boardSnapshot (live board is ~120 cards, one page per bucket). Otherwise unchanged endpoints; labels and title search page via fetchAllPages; 429 Retry-After honoured. Duplicate lookup reads the board rather than trusting the server's `s` search for case handling."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No files or long-lived handles; fetch timeouts cleared in finally. apply_plan reads labels at most once per plan. Each single-method op still re-reads the board 2-4 times for bucket checks; that is plain HTTP inside one method run (no per-op datastore sync), the cost the batch exists to avoid."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README, manifest and tests use example.com / v.example / vikunja.test and fictional labels; no IP literals. The 43 denylist patterns (comments stripped, as the hook does) match nothing in README.md, extensions/, manifest.yaml or LICENSE.md. The pre-push hook passed on every push; PR #11's body was checked by hand."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "issue",
+      "note": "Pre-existing, deliberate: VikunjaTaskSchema passes Vikunja's full task object through. The new BoardSnapshotSchema and PlanResultSchema also use .passthrough() though every field is built by the model; harmless, can be tightened later. get_task's `bucket` and create's `placement` are declared fields. New argument schemas are strict, with PlanOpSchema a discriminated union on `op`."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "New specs boardSnapshot and planResult declare lifetime and garbageCollection like the others."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Create (new_task, apply_plan create), read (board, get_task, list_recent, audit, due_report), update (update_task/set_labels/move_task/set_due_date and plan ops), close (close_task, plan close with humanInstructed). No delete: cards are closed, never deleted."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "Follow-up, carried: guards (done card, recent edit, readiness per bucket, done bucket, humanInstructed) are inline rather than labelled swamp pre-flight checks; force / humanInstructed / requireReady / duplicateTitle are the explicit overrides, and apply_plan's dry run is the batch pre-flight."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "vikunjaTask: task-<id> = this model's own last write (every writer, refreshed after its final read), get-<id> = reads (get_task and a new_task duplicate skip), list-<id> = list_recent. board-<projectId>, plan-<projectId>, audit-/reorder-/due- keep their own specs. apply_plan writes the single methods' task-<id> records plus one planResult; no two specs share a name in a run."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The recent-edit guard reads context.readResource('task-<id>'); a read failure falls through to refuse. No direct dataRepository access."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.09.27.2 adds an upgrades[] entry with identity upgradeAttributes: new methods, specs and optional args only; global arguments unchanged, so existing instances carry over."
+    }
+  ]
+}
