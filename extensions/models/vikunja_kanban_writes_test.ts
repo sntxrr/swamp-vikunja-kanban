@@ -348,7 +348,7 @@ Deno.test("skipIfTitleExists finds a duplicate beyond the first page", async () 
   const dupId = f.seed({ title: "shared prefix" });
   await withFake(f, async (run, store) => {
     await run("new_task", { title: "shared prefix", skipIfTitleExists: true });
-    assert(store.has(`task-${dupId}`), [...store.keys()].join(","));
+    assert(store.has(`get-${dupId}`), [...store.keys()].join(","));
   });
   assertEquals(f.writes, []);
   assertStrictEquals(f.tasks.size, 61);
@@ -483,7 +483,8 @@ Deno.test("duplicateTitle: refuse and skip match case-insensitively; allow creat
       title: "rotate the example key",
       skipIfTitleExists: true,
     });
-    assert(store.has(`task-${dup}`));
+    assert(store.has(`get-${dup}`));
+    assert(!store.has(`task-${dup}`));
     assertEquals(f.writes, []);
     await run("new_task", {
       title: "rotate the example key",
@@ -495,6 +496,23 @@ Deno.test("duplicateTitle: refuse and skip match case-insensitively; allow creat
     });
   });
   assertStrictEquals(f.tasks.size, 4);
+});
+
+Deno.test("a duplicate skip does not count as our write for the recent-edit guard", async () => {
+  const f = new FakeVikunja();
+  // Someone else edited this card just now.
+  const id = f.seed({ title: "Human card", updated: new Date().toISOString() });
+  await withFake(f, async (run, store) => {
+    await run("new_task", { title: "human card" });
+    assert(!store.has(`task-${id}`));
+    assert(store.has(`get-${id}`));
+    await assertRejects(
+      () => run("update_task", { taskId: id, priority: 5 }),
+      Error,
+      "force: true",
+    );
+  });
+  assertEquals(f.writes, []);
 });
 
 // ------------------------------------------------------------ board / get_task

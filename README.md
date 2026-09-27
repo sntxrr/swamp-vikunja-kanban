@@ -40,7 +40,7 @@ Before anything is written, the card is checked against the [readiness rules](#r
 |---|---|---|
 | `bucketName` | `defaultBucketName` (`Backlog`) | target bucket; its **role** picks the readiness rules |
 | `requireReady` | `false` | `true` applies the full Definition of Ready whatever the bucket |
-| `duplicateTitle` | `skip` | an open card with the same title (trimmed, case-insensitive): `refuse` = fail, nothing created; `skip` = create nothing, record the existing card; `allow` = create anyway |
+| `duplicateTitle` | `skip` | an open card with the same title (trimmed, case-insensitive): `refuse` = fail, nothing created; `skip` = create nothing, record the existing card as `get-<id>`; `allow` = create anyway |
 | `skipIfTitleExists` | — | deprecated alias: `true` = `skip`, `false` = `allow`; `duplicateTitle` wins if both are given |
 
 ```sh
@@ -246,7 +246,7 @@ globalArguments:
 
 ## Resources
 
-- `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`, `get_task` as `get-<id>` (with `bucket`), `list_recent` as `list-<id>`.
+- `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
 - `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
 - `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `converged`.

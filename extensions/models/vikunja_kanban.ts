@@ -1092,9 +1092,11 @@ async function newTask(
         "Task with matching title already exists \u2014 skipping create",
         { title: args.title, existingId: dup, projectId },
       );
+      // get-<id>, not task-<id>: this model did not write the card, and
+      // task-<id> is what guardWrite trusts as our own last write.
       const handle = await ctx.writeResource(
         "vikunjaTask",
-        `task-${dup}`,
+        `get-${dup}`,
         toVikunjaTask(await readTask(g, dup), fetchedAt),
       );
       return { dataHandles: [handle] };
