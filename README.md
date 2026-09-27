@@ -32,7 +32,16 @@ Built as a homelab-native replacement for `@webframp/hermes-kanban-orchestrator`
 
 ### `new_task`
 
-Creates a task in the configured project (or in `projectId` if given) and places it into a named kanban bucket. Optionally attaches existing labels by title: `label` (one) and/or `labels` (a list), case-insensitive. Every label must already exist on the Vikunja instance (this model never creates labels), and all of them are resolved **before** the task is created, so an unknown label fails with nothing created. By default, skips creation if a non-done task with the exact same title already exists in the project (best-effort idempotency; Vikunja has no native idempotency-key concept).
+Creates a task in the configured project (or in `projectId` if given) and places it into a named kanban bucket. Optionally attaches existing labels by title: `label` (one) and/or `labels` (a list), case-insensitive. Every label must already exist on the Vikunja instance (this model never creates labels), and all of them are resolved **before** the task is created, so an unknown label fails with nothing created.
+
+Before anything is written, the card is checked against the [readiness rules](#readiness-rules) of its target bucket — a stub is fine in Backlog, but the ready column gets the full Definition of Ready — and against open cards with the same title. After the write, title, description, priority, due date, labels and bucket are all read back; a mismatch is an error naming the task id.
+
+| Argument | Default | Behaviour |
+|---|---|---|
+| `bucketName` | `defaultBucketName` (`Backlog`) | target bucket; its **role** picks the readiness rules |
+| `requireReady` | `false` | `true` applies the full Definition of Ready whatever the bucket |
+| `duplicateTitle` | `skip` | an open card with the same title (trimmed, case-insensitive): `refuse` = fail, nothing created; `skip` = create nothing, record the existing card as `get-<id>`; `allow` = create anyway |
+| `skipIfTitleExists` | — | deprecated alias: `true` = `skip`, `false` = `allow`; `duplicateTitle` wins if both are given |
 
 ```sh
 swamp model method run homelab-backlog new_task \
@@ -64,6 +73,20 @@ Vikunja puts a newly created task into the kanban view's default bucket, and whe
 - The project's kanban view is discovered automatically via `GET /projects/{id}/views`; `viewId` is only an optional override for the default project.
 - The bucket is resolved (case-insensitive) **before** the task is created. An unknown bucket name is an error listing the available buckets, and nothing is created. If the move itself fails after creation, that is also an error (naming the task id) — never a silent fallback to the default column.
 - A project with no kanban view logs a warning and skips placement.
+
+#### Readiness rules
+
+One set of rules, shared by `audit` and the write paths so they cannot drift, keyed by the **role** of the target bucket (`bucketRoles`):
+
+| Target role | `new_task` | `move_task` / `apply_plan` move |
+|---|---|---|
+| backlog, blocked, other | a non-empty title | allowed |
+| ready | full Definition of Ready: description ≥ `minDescriptionChars`, a verdict marker, an acceptance marker, a `requiredLinkPrefix` link, a label for each `requiredLabelPrefixes` group (`tier-`) plus an area label, priority 1–5 | same — refused listing every failing rule unless `force: true` |
+| waiting | a due date | the card must have a due date, unless `force: true` |
+| doing, review | refused | allowed |
+| done | refused | refused (use `close_task`) |
+
+`requireReady: true` applies the ready rules to any bucket. Verdict markers match case-sensitively (`CONFIRMED`, not "confirmed" in prose); acceptance markers match case-insensitively (`Acceptance:`, "acceptance criteria", "verify with" all count) — the same as `audit`.
 
 ### `list_recent`
 
@@ -133,7 +156,7 @@ swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDat
 swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDate=""     # clear
 ```
 
-`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took **and** that the card is still in the same kanban bucket. Done cards are refused. The result is recorded as a `vikunjaTask` resource.
+`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took **and** that the card is still in the same kanban bucket. Done cards and cards someone else edited recently are refused (see **Guards** below), and so is clearing the date of a card in the waiting bucket; `force: true` overrides the last two. The result is recorded as a `vikunjaTask` resource.
 
 ### Editing existing cards: `update_task`, `set_labels`, `move_task`, `close_task`
 
@@ -147,10 +170,58 @@ swamp model method run homelab-backlog close_task  --arg taskId=62 --arg humanIn
 
 - **`update_task`** changes `title`, `description` and/or `priority`. It reads the full task, writes it back with only those fields changed, re-reads, and asserts every field took. If the write dropped the card out of its bucket, it moves the card back and verifies that too. An empty description is refused.
 - **`set_labels`** attaches (`add`) and detaches (`remove`) labels by title through the label endpoints, so the task body is never rewritten. Every title in either list must exist on the instance, so a typo fails instead of reading as "removed". A title in both lists is refused.
-- **`move_task`** moves a card into a named bucket and reads the placement back from the view. The done bucket is refused. Run it **after** field edits: a full-replace write can drop a card out of its bucket.
+- **`move_task`** moves a card into a named bucket and reads the placement back from the view. The done bucket is refused; the ready bucket needs the full Definition of Ready and waiting a due date (the refusal lists every failing rule; `force: true` overrides). Run it **after** field edits: a full-replace write can drop a card out of its bucket.
 - **`close_task`** sets `done: true`, moves the card into the done bucket, and reads both back. It refuses to run unless `humanInstructed: true`: closing a card is a person's decision. It is safe to re-run on a card that is already closed.
 
-**Guards.** `update_task`, `set_labels` and `move_task` refuse done cards, and cards updated within `policy.recentEditMinutes` (default 60) by anything other than this model. A card counts as this model's own when its `updated` matches the one recorded in its `task-<id>` resource by the model's last write, so a card the model just created or edited can be edited again straight away. Pass `force: true` to override; set the policy to `0` to turn the guard off.
+**Guards.** `update_task`, `set_labels`, `move_task` and `set_due_date` refuse done cards, and cards updated within `policy.recentEditMinutes` (default 60) by anything other than this model. A card counts as this model's own when its `updated` matches the one recorded in its `task-<id>` resource by the model's last write, so a card the model just created or edited can be edited again straight away. Pass `force: true` to override; set the policy to `0` to turn the guard off.
+
+### `apply_plan`
+
+Batches card writes into **one** method run — each swamp CLI call has a fixed cost, so a grooming pass should be one dry run and one apply, not dozens of calls. `ops` is a list discriminated on `op`:
+
+| `op` | Fields | Runs as |
+|---|---|---|
+| `create` | `title`, `description`, `labels`, `priority`, `dueDate`, `bucketName`, `duplicateTitle` (default **`refuse`** in a plan), `requireReady` | `new_task` |
+| `update` | `taskId`, `title` / `description` / `priority`, `force` | `update_task` |
+| `labels` | `taskId`, `add`, `remove`, `force` | `set_labels` |
+| `move` | `taskId`, `bucketName`, `force` | `move_task` |
+| `due` | `taskId`, `dueDate` (`null` clears), `force` | `set_due_date` |
+| `close` | `taskId`, `humanInstructed: true` (required on every close) | `close_task` |
+
+Plan-level arguments: `apply` (default **`false`**, a dry run), `requireReady` (default **`true`**: every create must meet the full Definition of Ready; a create's own `requireReady` overrides it), `maxOps` (default 60), `projectId`.
+
+1. **Validate (always).** One read of the board, one read of the labels (only when an op names labels), then every op is checked against live state and the [readiness rules](#readiness-rules), simulating the ops in order so each is judged on the state the earlier ones leave. It collects **every** problem: unknown or done card, the recent-edit guard, unknown label or bucket, a create or move that fails its bucket's rules, a duplicate title on the board or within the plan, an op after the card's close, a close without `humanInstructed`, an empty update, an unparseable date, more ops than `maxOps`. A move to the ready column placed before the op that makes the card ready is refused with a hint to reorder.
+2. **Dry run** (`apply: false`): writes nothing to Vikunja, only the `planResult` resource.
+3. **Apply** (`apply: true`): if validation found **any** problem, nothing is written and the method fails listing them all. Otherwise the ops run in order through the single methods' own code — every write read back and recorded as `task-<id>`, so later ops on the same card pass the guard as this model's own — and the run stops at the first failure, reporting which ops are done, failed and not run.
+
+```sh
+cat > plan.json <<'JSON'
+{"ops": [
+  {"op": "update", "taskId": 62, "description": "<p>…</p>", "priority": 3},
+  {"op": "labels", "taskId": 62, "add": ["homelab-area", "tier-a"]},
+  {"op": "move",   "taskId": 62, "bucketName": "Next"},
+  {"op": "due",    "taskId": 71, "dueDate": "2026-11-04T17:00:00Z"},
+  {"op": "move",   "taskId": 71, "bucketName": "Waiting"}
+]}
+JSON
+swamp model method run homelab-backlog apply_plan --input-file plan.json          # dry run
+jq '.apply = true' plan.json > apply.json
+swamp model method run homelab-backlog apply_plan --input-file apply.json         # all or nothing, then in order
+```
+
+The `planResult` resource (`plan-<projectId>`) records `outcome` (`dry-run` / `refused` / `applied` / `failed`), `valid`, `counts`, every problem (`index`, `op`, `taskId`, `problem`), and each op's `status` (`ok`, `invalid`, `skip`, `done`, `failed`, `not-run`) with the created card's id for a create.
+
+### `board` and `get_task`
+
+Read-only.
+
+```sh
+swamp model method run homelab-backlog board                       # boardSnapshot board-<projectId>
+swamp model method run homelab-backlog get_task --arg taskId=62    # vikunjaTask get-62
+```
+
+- **`board`** writes every card that is not done and not in the done bucket — id, title, full description, bucket and its role, labels, priority, due date, created, updated, position — as one `boardSnapshot` resource, read page by page so no bucket is truncated. A 120-card board with ~670-character descriptions is about 113 KB.
+- **`get_task`** writes one card plus the bucket (and role) it sits in, as the `vikunjaTask` resource `get-<id>`. Not `task-<id>`: that name records this model's own last write, which the recent-edit guard trusts, so a read must not overwrite it.
 
 ### Board shape and thresholds
 
@@ -175,10 +246,12 @@ globalArguments:
 
 ## Resources
 
-- `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`).
+- `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
 - `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
 - `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `converged`.
+- `boardSnapshot` — every open card on a board (see `board`) with per-bucket counts.
+- `planResult` — one `apply_plan` run: outcome, problems, per-op status.
 - `dueReport` — one due-date pass: `overdue`, `dueToday`, `upcoming` (each `id`, `title`, `bucket`, `dueDate`, `daysUntil`, `url`), `counts` (incl. `actionable`), the Markdown `message`, and `boardUrl`.
 
 ## Notes

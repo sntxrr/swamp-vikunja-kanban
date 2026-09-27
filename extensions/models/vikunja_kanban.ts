@@ -129,7 +129,8 @@ const GlobalArgsSchema = z.object({
       "Within equal priority, whether older or newer cards sort first.",
     ),
     recentEditMinutes: z.number().int().min(0).default(60).describe(
-      "Write methods (update_task, set_labels, move_task) refuse a card " +
+      "Write methods (update_task, set_labels, move_task, set_due_date, " +
+        "and their apply_plan ops) refuse a card " +
         "updated within this many minutes unless the last update was this " +
         "model's own recorded write, or force: true is passed. It keeps " +
         "automation from overwriting a card someone is editing. 0 disables.",
@@ -191,6 +192,11 @@ const VikunjaTaskSchema = z.object({
     "Kanban bucket this run placed the task into (absent when placement " +
       "was disabled or the task already existed).",
   ),
+  bucket: z.object({ title: z.string(), role: z.string() }).nullable()
+    .optional().describe(
+      "Bucket the card sat in when get_task read it (null: not on the " +
+        "kanban view).",
+    ),
   created: z.string().nullable().optional().describe(
     "Creation timestamp from Vikunja.",
   ),
@@ -318,6 +324,86 @@ const DueReportSchema = z.object({
 /** The `dueReport` resource written by due_report. */
 export type DueReport = z.infer<typeof DueReportSchema>;
 
+const BoardCardSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  description: z.string().describe("Description HTML as stored."),
+  bucket: z.string().describe("Title of the bucket the card sits in."),
+  role: z.string().describe("That bucket's role (bucketRoles), or other."),
+  labels: z.array(z.string()),
+  priority: z.number(),
+  dueDate: z.string().nullable().describe("ISO 8601, or null when unset."),
+  updated: z.string(),
+  created: z.string(),
+  position: z.number().describe("Position within the bucket (view order)."),
+});
+
+const BoardSnapshotSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  fetchedAt: z.string(),
+  buckets: z.array(z.object({
+    id: z.number(),
+    title: z.string(),
+    role: z.string(),
+    count: z.number().describe("Cards of this bucket in `cards`."),
+  })).describe("Every bucket in view order, the done bucket included."),
+  cards: z.array(BoardCardSchema).describe(
+    "Every card that is not done and not in the done bucket, bucket by " +
+      "bucket in view order.",
+  ),
+  total: z.number(),
+}).passthrough();
+/** The `boardSnapshot` resource written by board. */
+export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
+
+const PlanOpResultSchema = z.object({
+  index: z.number().describe("0-based position in ops."),
+  op: z.string(),
+  taskId: z.number().nullable().describe(
+    "The card the op targets; for a create, the id it got (or the " +
+      "existing card a skip found).",
+  ),
+  title: z.string().nullable(),
+  status: z.enum(["ok", "invalid", "skip", "done", "failed", "not-run"])
+    .describe(
+      "ok: valid, not run (dry run, or refused plan). invalid: has " +
+        "problems. skip: a create whose title exists (duplicateTitle " +
+        "skip). done / failed / not-run: what apply did.",
+    ),
+  problems: z.array(z.string()),
+  error: z.string().optional().describe("Why a failed op failed."),
+});
+
+const PlanResultSchema = z.object({
+  projectId: z.number(),
+  viewId: z.number(),
+  plannedAt: z.string(),
+  outcome: z.enum(["dry-run", "refused", "applied", "failed"]).describe(
+    "dry-run: nothing written. refused: apply was asked but at least one " +
+      "problem was found, so nothing was written. applied: every op ran " +
+      "and read back. failed: stopped at the first failing op.",
+  ),
+  valid: z.boolean().describe("True when validation found no problems."),
+  counts: z.object({
+    ops: z.number(),
+    problems: z.number(),
+    done: z.number(),
+    failed: z.number(),
+    notRun: z.number(),
+    skipped: z.number(),
+  }),
+  problems: z.array(z.object({
+    index: z.number().nullable().describe("null: a plan-level problem."),
+    op: z.string().nullable(),
+    taskId: z.number().nullable(),
+    problem: z.string(),
+  })).describe("Every validation problem, in op order."),
+  ops: z.array(PlanOpResultSchema),
+}).passthrough();
+/** The `planResult` resource written by apply_plan. */
+export type PlanResult = z.infer<typeof PlanResultSchema>;
+
 // ============================================================================
 // Method argument schemas
 // ============================================================================
@@ -357,16 +443,40 @@ const NewTaskArgsSchema = z.object({
       "so an unknown name fails with nothing created. Empty string " +
       "disables placement for this call.",
   ),
-  skipIfTitleExists: z.boolean().default(true).describe(
-    "If true (default), checks for a non-done task with the exact same " +
-      "title in the project first and skips creation (idempotency without " +
-      "a dedicated dedup key — Vikunja has no idempotency-key concept).",
+  duplicateTitle: z.enum(["refuse", "skip", "allow"]).optional().describe(
+    "What to do when a non-done task in the project already has this title " +
+      "(trimmed, case-insensitive): refuse = fail with nothing created; " +
+      "skip = create nothing and record the existing task as the result " +
+      "(idempotency — Vikunja has no idempotency key); allow = create " +
+      "anyway. Default: skip, or allow when skipIfTitleExists is false.",
+  ),
+  skipIfTitleExists: z.boolean().optional().describe(
+    "Deprecated alias kept for existing callers: true (the old default) = " +
+      'duplicateTitle "skip", false = "allow". duplicateTitle wins when ' +
+      "both are given.",
+  ),
+  requireReady: z.boolean().default(false).describe(
+    "Apply the full Definition of Ready (as audit checks it in the ready " +
+      "column) whatever the target bucket. Creating into the ready bucket " +
+      "always applies it.",
   ),
 });
 type NewTaskArgs = z.infer<typeof NewTaskArgsSchema>;
 
 const AuditArgsSchema = z.object({
   projectId: ProjectIdOverride,
+});
+
+const BoardArgsSchema = z.object({
+  projectId: ProjectIdOverride,
+});
+
+const GetTaskArgsSchema = z.object({
+  taskId: z.number().int().positive().describe("Vikunja task id."),
+  projectId: ProjectIdOverride.describe(
+    "Project whose kanban view is read for the card's bucket. Defaults to " +
+      "the configured projectId.",
+  ),
 });
 
 const DueReportArgsSchema = z.object({
@@ -390,6 +500,11 @@ const SetDueDateArgsSchema = z.object({
   projectId: ProjectIdOverride.describe(
     "Project whose kanban view is read to assert the card's bucket did not " +
       "change. Defaults to the configured projectId.",
+  ),
+  force: z.boolean().default(false).describe(
+    "Write even though the card was updated within " +
+      "policy.recentEditMinutes by something other than this model, or " +
+      "clear the due date of a card in the waiting bucket.",
   ),
 });
 
@@ -449,10 +564,15 @@ const MoveTaskArgsSchema = z.object({
   taskId: TaskId,
   bucketName: z.string().min(1).describe(
     "Bucket title (case-insensitive) to move the card into. The done " +
-      "bucket is refused; use close_task.",
+      "bucket is refused; use close_task. Moving into the ready bucket " +
+      "needs the full Definition of Ready, and into waiting a due date.",
   ),
   projectId: BoardProject,
-  force: Force,
+  force: Force.describe(
+    "Write even though the card was updated within " +
+      "policy.recentEditMinutes by something other than this model, or " +
+      "does not meet the target bucket's readiness rules.",
+  ),
 });
 
 const CloseTaskArgsSchema = z.object({
@@ -491,6 +611,95 @@ const ListRecentArgsSchema = z.object({
     "Include tasks already marked done.",
   ),
 });
+
+const PlanForce = z.boolean().default(false).describe(
+  "Per-op override, as on the single methods: write despite the " +
+    "recent-edit guard (and, for move, the target bucket's readiness " +
+    "rules; for due, clearing a waiting card's date).",
+);
+
+const PlanOpSchema = z.discriminatedUnion("op", [
+  z.object({
+    op: z.literal("create"),
+    title: z.string().min(1),
+    description: z.string().optional(),
+    labels: z.array(z.string().min(1)).default([]),
+    priority: z.number().int().min(0).max(5).optional(),
+    dueDate: z.string().optional(),
+    bucketName: z.string().optional().describe(
+      "Default: the defaultBucketName global argument.",
+    ),
+    duplicateTitle: z.enum(["refuse", "skip", "allow"]).default("refuse")
+      .describe(
+        "As new_task, but refuse by default inside a plan. skip leaves " +
+          "the op out of the run and reports the existing card.",
+      ),
+    requireReady: z.boolean().optional().describe(
+      "Overrides the plan's requireReady for this create.",
+    ),
+  }),
+  z.object({
+    op: z.literal("update"),
+    taskId: z.number().int().positive(),
+    title: z.string().optional(),
+    description: z.string().optional(),
+    priority: z.number().int().min(0).max(5).optional(),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("labels"),
+    taskId: z.number().int().positive(),
+    add: z.array(z.string().min(1)).default([]),
+    remove: z.array(z.string().min(1)).default([]),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("move"),
+    taskId: z.number().int().positive(),
+    bucketName: z.string().min(1),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("due"),
+    taskId: z.number().int().positive(),
+    dueDate: z.string().nullable().describe('ISO 8601; null or "" clears.'),
+    force: PlanForce,
+  }),
+  z.object({
+    op: z.literal("close"),
+    taskId: z.number().int().positive(),
+    humanInstructed: z.boolean().default(false).describe(
+      "Must be true on every close op: a person asked for it.",
+    ),
+  }),
+]);
+/** One operation of an apply_plan batch. */
+export type PlanOp = z.infer<typeof PlanOpSchema>;
+
+const ApplyPlanArgsSchema = z.object({
+  ops: z.array(PlanOpSchema).min(1).describe(
+    "Operations, run in this order. Discriminated on `op`: create " +
+      "(new_task fields), update (taskId + title/description/priority), " +
+      "labels (taskId + add/remove), move (taskId + bucketName), due " +
+      "(taskId + dueDate, null clears), close (taskId + humanInstructed: " +
+      "true).",
+  ),
+  apply: z.boolean().default(false).describe(
+    "false (default): validate every op against the live board and write " +
+      "only the planResult resource. true: validate, and write NOTHING " +
+      "unless every op is valid; then run the ops in order, stopping at " +
+      "the first failure.",
+  ),
+  requireReady: z.boolean().default(true).describe(
+    "Apply the full Definition of Ready to every create, whatever its " +
+      "bucket (a create op's own requireReady overrides it).",
+  ),
+  maxOps: z.number().int().min(1).max(500).default(60).describe(
+    "Refuse a plan with more ops than this.",
+  ),
+  projectId: ProjectIdOverride,
+});
+type ApplyPlanArgs = z.infer<typeof ApplyPlanArgsSchema>;
 
 // ============================================================================
 // Execution context
@@ -808,29 +1017,7 @@ async function newTask(
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const fetchedAt = new Date().toISOString();
   const projectId = args.projectId ?? g.projectId;
-
-  if (args.skipIfTitleExists) {
-    const existing = await fetchAllPages(g, `/projects/${projectId}/tasks`, {
-      s: args.title,
-    });
-    const dup = existing.find((t) =>
-      typeof t.title === "string" &&
-      t.title === args.title &&
-      t.done !== true
-    );
-    if (dup && typeof dup.id === "number") {
-      ctx.logger?.info(
-        "Task with matching title already exists \u2014 skipping create",
-        { title: args.title, existingId: dup.id, projectId },
-      );
-      const handle = await ctx.writeResource(
-        "vikunjaTask",
-        `task-${dup.id}`,
-        toVikunjaTask(dup, fetchedAt),
-      );
-      return { dataHandles: [handle] };
-    }
-  }
+  const duplicates = duplicateModeOf(args);
 
   // Resolve the destination bucket up front: an unknown bucket name must
   // fail here, before anything is created, rather than leave a task sitting
@@ -838,8 +1025,10 @@ async function newTask(
   const bucketName = args.bucketName ?? g.defaultBucketName;
   let target: { viewId: number; bucketId: number; bucketTitle: string } | null =
     null;
+  const viewId = bucketName || duplicates !== "allow"
+    ? await resolveKanbanViewId(g, projectId)
+    : null;
   if (bucketName) {
-    const viewId = await resolveKanbanViewId(g, projectId);
     if (viewId === null) {
       ctx.logger?.warning(
         "Project has no kanban view \u2014 skipping bucket placement",
@@ -859,9 +1048,64 @@ async function newTask(
     ? resolveLabels(await fetchAllLabels(g), labelNames)
     : [];
 
+  // Readiness, keyed by the destination bucket's role. With placement
+  // disabled there is no role, so only the title is required (unless
+  // requireReady).
+  const wantedDue = args.dueDate?.trim() ? args.dueDate.trim() : null;
+  if (wantedDue !== null && !Number.isFinite(Date.parse(wantedDue))) {
+    throw new Error(`dueDate is not a parseable instant: ${args.dueDate}`);
+  }
+  const role: Role = target
+    ? roleOf(target.bucketTitle, g.bucketRoles)
+    : "other";
+  const problems = readinessProblems(
+    {
+      title: args.title,
+      description: args.description ?? "",
+      labels: labels.map((l) => l.title),
+      priority: args.priority ?? 0,
+      dueDate: wantedDue,
+    },
+    role,
+    g.policy,
+    { intent: "create", requireReady: args.requireReady },
+  );
+  if (problems.length) {
+    throw new Error(
+      `Refusing to create "${args.title}" in ` +
+        `"${target?.bucketTitle ?? "(no bucket)"}": ` +
+        `${formatProblems(problems)}. Nothing was created.`,
+    );
+  }
+
+  if (duplicates !== "allow") {
+    const dup = await findOpenTitle(g, projectId, viewId, args.title);
+    if (dup !== null) {
+      if (duplicates === "refuse") {
+        throw new Error(
+          `Refusing to create "${args.title}": open task ${dup} already has ` +
+            `that title (case-insensitive). Nothing was created; pass ` +
+            `duplicateTitle: "allow" to create it anyway.`,
+        );
+      }
+      ctx.logger?.info(
+        "Task with matching title already exists \u2014 skipping create",
+        { title: args.title, existingId: dup, projectId },
+      );
+      // get-<id>, not task-<id>: this model did not write the card, and
+      // task-<id> is what guardWrite trusts as our own last write.
+      const handle = await ctx.writeResource(
+        "vikunjaTask",
+        `get-${dup}`,
+        toVikunjaTask(await readTask(g, dup), fetchedAt),
+      );
+      return { dataHandles: [handle] };
+    }
+  }
+
   const body: Record<string, unknown> = { title: args.title };
   if (args.description) body.description = args.description;
-  if (args.dueDate) body.due_date = args.dueDate;
+  if (wantedDue !== null) body.due_date = wantedDue;
   if (args.priority !== undefined) body.priority = args.priority;
 
   const created = await vreq(
@@ -876,6 +1120,22 @@ async function newTask(
     throw new Error(
       `Vikunja task creation for "${args.title}" returned no numeric id.`,
     );
+  }
+
+  // A create can ignore due_date (and priority): fix them with a
+  // full-replace write now, before labels and the bucket move.
+  const fresh = await readTask(g, taskId);
+  const fix: Record<string, unknown> = {};
+  if (args.priority !== undefined && fresh.priority !== args.priority) {
+    fix.priority = args.priority;
+  }
+  if (
+    wantedDue !== null && !sameInstant(dueDateOf(fresh.due_date), wantedDue)
+  ) {
+    fix.due_date = wantedDue;
+  }
+  if (Object.keys(fix).length) {
+    await vreq(g, "POST", `/tasks/${taskId}`, { body: { ...fresh, ...fix } });
   }
 
   for (const label of labels) {
@@ -917,18 +1177,25 @@ async function newTask(
     );
   }
 
+  // Full read-back: HTTP 200 proves nothing.
   const final = await readTask(g, taskId);
-  const have = labelTitlesOf(final);
-  const missing = labels.filter((l) => !have.has(l.title.toLowerCase()));
-  if (missing.length) {
-    throw new Error(
-      `Task ${taskId} was created but label(s) ` +
-        `${
-          missing.map((l) => l.title).join(", ")
-        } are not on it after the write.`,
-    );
+  const errors = createReadBackErrors(final, {
+    title: args.title,
+    description: args.description || undefined,
+    priority: args.priority,
+    dueDate: wantedDue,
+    labels: labels.map((l) => l.title),
+  });
+  if (target) {
+    const bucket = await bucketTitleOf(g, projectId, target.viewId, taskId);
+    if (bucket !== target.bucketTitle) {
+      errors.push(
+        `bucket read back as "${bucket}", not "${target.bucketTitle}"`,
+      );
+    }
   }
 
+  // Record it even on a mismatch, so a follow-up edit is recognised as ours.
   const handle = await ctx.writeResource(
     "vikunjaTask",
     `task-${taskId}`,
@@ -937,12 +1204,101 @@ async function newTask(
       fetchedAt,
     ),
   );
+  if (errors.length) {
+    throw new Error(
+      `Task ${taskId} was created but did not read back as sent: ` +
+        `${errors.join("; ")}.`,
+    );
+  }
   ctx.logger?.info(`Vikunja task created: ${taskId}`, {
     title: args.title,
     projectId,
     bucket: target?.bucketTitle ?? null,
   });
   return { dataHandles: [handle] };
+}
+
+/** new_task's duplicate policy, honouring the deprecated skipIfTitleExists. */
+function duplicateModeOf(
+  args: Pick<NewTaskArgs, "duplicateTitle" | "skipIfTitleExists">,
+): "refuse" | "skip" | "allow" {
+  if (args.duplicateTitle) return args.duplicateTitle;
+  return args.skipIfTitleExists === false ? "allow" : "skip";
+}
+
+/** Both unset, or the same instant however it is written. */
+function sameInstant(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === b;
+  return Date.parse(a) === Date.parse(b);
+}
+
+/**
+ * The id of a not-done task in the project whose title matches (trimmed,
+ * case-insensitive), or null. Reads the kanban board when there is one —
+ * every task sits in a bucket, and the match cannot depend on how the
+ * server's `s` search treats case — else the paged title search.
+ */
+async function findOpenTitle(
+  g: GlobalArgs,
+  projectId: number,
+  viewId: number | null,
+  title: string,
+): Promise<number | null> {
+  const open: Array<{ id: number; title: string }> = [];
+  if (viewId !== null) {
+    for (const b of await fetchBoard(g, projectId, viewId)) {
+      if (roleOf(b.title, g.bucketRoles) === "done") continue;
+      open.push(...b.tasks.filter((t) => !t.done));
+    }
+  } else {
+    for (
+      const t of await fetchAllPages(g, `/projects/${projectId}/tasks`, {
+        s: title.trim(),
+      })
+    ) {
+      if (
+        typeof t.id === "number" && typeof t.title === "string" &&
+        t.done !== true
+      ) open.push({ id: t.id, title: t.title });
+    }
+  }
+  return open.find((t) => sameTitle(t.title, title))?.id ?? null;
+}
+
+/**
+ * Compare a created task, as read back, with what was asked for. Fields
+ * that were not given are not checked. Returns one line per mismatch.
+ */
+export function createReadBackErrors(
+  got: Record<string, unknown>,
+  want: {
+    title: string;
+    description?: string;
+    priority?: number;
+    dueDate: string | null;
+    labels: string[];
+  },
+): string[] {
+  const errors: string[] = [];
+  if (got.title !== want.title) {
+    errors.push(`title read back as ${JSON.stringify(got.title)}`);
+  }
+  if (want.description !== undefined && got.description !== want.description) {
+    const len = typeof got.description === "string"
+      ? textLength(got.description)
+      : 0;
+    errors.push(`description read back differs (${len} visible chars)`);
+  }
+  if (want.priority !== undefined && got.priority !== want.priority) {
+    errors.push(`priority read back as ${got.priority}`);
+  }
+  if (!sameInstant(dueDateOf(got.due_date), want.dueDate)) {
+    errors.push(`due date read back as ${dueDateOf(got.due_date)}`);
+  }
+  const have = labelTitlesOf(got);
+  const missing = want.labels.filter((l) => !have.has(l.toLowerCase()));
+  if (missing.length) errors.push(`label(s) ${missing.join(", ")} missing`);
+  return errors;
 }
 
 async function listRecent(
@@ -1158,6 +1514,205 @@ function daysBetween(fromIso: string, now: Date): number | null {
   return (now.getTime() - t) / 86_400_000;
 }
 
+// ============================================================================
+// Readiness rules — shared by audit and every write path
+// ============================================================================
+
+/** The fields of a card the Definition-of-Ready rules look at. */
+export interface CardState {
+  title: string;
+  description: string;
+  labels: string[];
+  priority: number;
+  dueDate: string | null;
+}
+
+/**
+ * One Definition-of-Ready check that failed. `weight` is how hard the rule
+ * is outside the ready column: `always` is an error everywhere, `must` an
+ * error in executable columns and a warning elsewhere, `marker` an error in
+ * executable columns and info elsewhere. Writes that enforce readiness treat
+ * every weight as a refusal.
+ */
+export interface DorCheck {
+  rule: string;
+  detail: string;
+  weight: "always" | "must" | "marker";
+}
+
+/**
+ * The Definition-of-Ready content rules, in the order audit reports them:
+ * description length, label groups, priority, then the verdict / acceptance
+ * / source-link markers (only checked when the description has text).
+ *
+ * Marker matching: verdict markers are case-SENSITIVE (a verdict is a
+ * shouted word, and "confirmed" in prose is not one); acceptance markers
+ * are case-INSENSITIVE ("Acceptance:", "acceptance criteria", "verify
+ * with" all count). The source link is a case-sensitive prefix match.
+ */
+export function dorChecks(
+  card: Pick<CardState, "description" | "labels" | "priority">,
+  policy: Policy,
+): DorCheck[] {
+  const out: DorCheck[] = [];
+  const add = (rule: string, weight: DorCheck["weight"], detail: string) =>
+    out.push({ rule, detail, weight });
+
+  const len = textLength(card.description);
+  if (len === 0) add("empty-description", "always", "description is empty");
+  else if (len < policy.minDescriptionChars) {
+    add(
+      "short-description",
+      "must",
+      `${len} chars < ${policy.minDescriptionChars}`,
+    );
+  }
+
+  if (card.labels.length === 0) add("no-labels", "must", "no labels at all");
+  else {
+    for (const prefix of policy.requiredLabelPrefixes) {
+      if (
+        !card.labels.some((l) =>
+          l.toLowerCase().startsWith(prefix.toLowerCase())
+        )
+      ) {
+        add(
+          "missing-label-group",
+          "must",
+          `no label starting with "${prefix}"`,
+        );
+      }
+    }
+    const isGroup = (l: string) =>
+      policy.requiredLabelPrefixes.some((p) =>
+        l.toLowerCase().startsWith(p.toLowerCase())
+      );
+    if (!card.labels.some((l) => !isGroup(l))) {
+      add("missing-area-label", "must", "only group labels, no area label");
+    }
+  }
+
+  if (card.priority < 1 || card.priority > 5) {
+    add(
+      "priority-unset",
+      "must",
+      card.priority === 0
+        ? "priority is 0 (unset)"
+        : `priority ${card.priority} is outside 1-5`,
+    );
+  }
+
+  if (len > 0) {
+    const desc = card.description;
+    if (!policy.verdictMarkers.some((m) => desc.includes(m))) {
+      add(
+        "missing-verdict",
+        "marker",
+        `no premise-check verdict (${policy.verdictMarkers.join("/")})`,
+      );
+    }
+    const lower = desc.toLowerCase();
+    if (
+      !policy.acceptanceMarkers.some((m) => lower.includes(m.toLowerCase()))
+    ) {
+      add(
+        "missing-acceptance",
+        "marker",
+        `no acceptance marker (${policy.acceptanceMarkers.join("/")})`,
+      );
+    }
+    if (
+      policy.requiredLinkPrefix && !desc.includes(policy.requiredLinkPrefix)
+    ) {
+      add(
+        "missing-link",
+        "must",
+        `no ${policy.requiredLinkPrefix} link to the source note`,
+      );
+    }
+  }
+  return out;
+}
+
+/** A reason a write is refused by the readiness rules. */
+export interface ReadinessProblem {
+  rule: string;
+  detail: string;
+}
+
+/**
+ * What a card must satisfy to be created in, or moved into, a bucket of
+ * `role` — the write-side counterpart of audit, built on the same checks:
+ *
+ * - every card: a non-empty title;
+ * - create into doing / review / done: refused (people start and finish
+ *   work); move into done: refused (close_task);
+ * - ready: the full Definition of Ready (dorChecks, every weight) — which
+ *   includes a label matching each requiredLabelPrefixes group, at least
+ *   one label outside them (the area), and priority 1-5;
+ * - waiting: a due date;
+ * - backlog / blocked / other: nothing more, so automation can file stubs.
+ *
+ * `requireReady` applies the full Definition of Ready whatever the role.
+ */
+export function readinessProblems(
+  card: CardState,
+  role: Role,
+  policy: Policy,
+  opts: { intent: "create" | "move"; requireReady?: boolean },
+): ReadinessProblem[] {
+  const out: ReadinessProblem[] = [];
+  if (card.title.trim() === "") {
+    out.push({ rule: "empty-title", detail: "title is empty" });
+  }
+  const refused = opts.intent === "create"
+    ? role === "doing" || role === "review" || role === "done"
+    : role === "done";
+  if (refused) {
+    out.push({
+      rule: "refused-bucket",
+      detail: opts.intent === "create"
+        ? `new cards are never created in the ${role} column`
+        : "moving into the done column is close_task's job",
+    });
+  }
+  if (role === "ready" || opts.requireReady) {
+    for (const c of dorChecks(card, policy)) {
+      out.push({ rule: c.rule, detail: c.detail });
+    }
+  }
+  if (role === "waiting" && card.dueDate === null) {
+    out.push({
+      rule: "missing-due-date",
+      detail: "a waiting card needs a due date — the day to look at it again",
+    });
+  }
+  return out;
+}
+
+/** One line per problem, for error messages. */
+export function formatProblems(ps: ReadinessProblem[]): string {
+  return ps.map((p) => `${p.rule} (${p.detail})`).join("; ");
+}
+
+/** The readiness view of a raw Vikunja task object. */
+function cardStateOf(raw: Record<string, unknown>): CardState {
+  return {
+    title: typeof raw.title === "string" ? raw.title : "",
+    description: typeof raw.description === "string" ? raw.description : "",
+    labels: asArray(raw.labels).map((l) => l.title).filter((
+      t,
+    ): t is string => typeof t === "string"),
+    priority: typeof raw.priority === "number" ? raw.priority : 0,
+    dueDate: dueDateOf(raw.due_date),
+  };
+}
+
+/** Title comparison used for duplicate detection: trimmed, case-insensitive. */
+export function sameTitle(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
 /**
  * Findings for one card, scoped by the role of the bucket it sits in. The
  * full Definition of Ready is only *required* (error) in the ready column
@@ -1218,66 +1773,20 @@ export function auditCard(
     }
   }
 
-  const len = textLength(task.description);
-  if (len === 0) add("empty-description", "error", "description is empty");
-  else if (len < policy.minDescriptionChars) {
+  // The content rules are shared with the write paths (readinessProblems);
+  // only the severity depends on where the card sits.
+  for (const c of dorChecks(task, policy)) {
     add(
-      "short-description",
-      must,
-      `${len} chars < ${policy.minDescriptionChars}`,
+      c.rule,
+      c.weight === "always"
+        ? "error"
+        : c.weight === "must"
+        ? must
+        : executable
+        ? "error"
+        : "info",
+      c.detail,
     );
-  }
-
-  if (task.labels.length === 0) add("no-labels", must, "no labels at all");
-  else {
-    for (const prefix of policy.requiredLabelPrefixes) {
-      if (
-        !task.labels.some((l) =>
-          l.toLowerCase().startsWith(prefix.toLowerCase())
-        )
-      ) {
-        add("missing-label-group", must, `no label starting with "${prefix}"`);
-      }
-    }
-    const isGroup = (l: string) =>
-      policy.requiredLabelPrefixes.some((p) =>
-        l.toLowerCase().startsWith(p.toLowerCase())
-      );
-    if (!task.labels.some((l) => !isGroup(l))) {
-      add("missing-area-label", must, "only group labels, no area label");
-    }
-  }
-
-  if (task.priority === 0) add("priority-unset", must, "priority is 0 (unset)");
-
-  if (len > 0) {
-    const desc = task.description;
-    if (!policy.verdictMarkers.some((m) => desc.includes(m))) {
-      add(
-        "missing-verdict",
-        executable ? "error" : "info",
-        `no premise-check verdict (${policy.verdictMarkers.join("/")})`,
-      );
-    }
-    const lower = desc.toLowerCase();
-    if (
-      !policy.acceptanceMarkers.some((m) => lower.includes(m.toLowerCase()))
-    ) {
-      add(
-        "missing-acceptance",
-        executable ? "error" : "info",
-        `no acceptance marker (${policy.acceptanceMarkers.join("/")})`,
-      );
-    }
-    if (
-      policy.requiredLinkPrefix && !desc.includes(policy.requiredLinkPrefix)
-    ) {
-      add(
-        "missing-link",
-        must,
-        `no ${policy.requiredLinkPrefix} link to the source note`,
-      );
-    }
   }
 
   const staleAfter =
@@ -1585,6 +2094,104 @@ async function dueReport(
   return { dataHandles: [handle] };
 }
 
+/**
+ * The not-done cards of a board as one flat, bucket-ordered list, with the
+ * fields a planner needs (the whole description included).
+ */
+export function snapshotBoard(
+  board: BoardBucket[],
+  roles: Roles,
+): Pick<BoardSnapshot, "buckets" | "cards" | "total"> {
+  const buckets: BoardSnapshot["buckets"] = [];
+  const cards: BoardSnapshot["cards"] = [];
+  for (const b of board) {
+    const role = roleOf(b.title, roles);
+    const open = role === "done" ? [] : b.tasks.filter((t) => !t.done);
+    buckets.push({ id: b.id, title: b.title, role, count: open.length });
+    for (const t of open) {
+      cards.push({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        bucket: b.title,
+        role,
+        labels: t.labels,
+        priority: t.priority,
+        dueDate: t.dueDate,
+        updated: t.updated,
+        created: t.created,
+        position: t.position,
+      });
+    }
+  }
+  return { buckets, cards, total: cards.length };
+}
+
+/**
+ * Read-only: write every not-done card on the board, with its bucket,
+ * role, labels, priority, due date and full description, as one
+ * boardSnapshot resource, so a caller can plan a batch from one read.
+ */
+async function boardMethod(
+  args: z.infer<typeof BoardArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+  const snapshot = BoardSnapshotSchema.parse({
+    projectId,
+    viewId,
+    fetchedAt,
+    ...snapshotBoard(board, g.bucketRoles),
+  });
+  const handle = await ctx.writeResource(
+    "boardSnapshot",
+    `board-${projectId}`,
+    snapshot,
+  );
+  ctx.logger?.info(
+    `Board of project ${projectId}: ${snapshot.total} open cards in ` +
+      `${snapshot.buckets.length} buckets`,
+  );
+  return { dataHandles: [handle] };
+}
+
+/**
+ * Read-only: one card and the bucket it sits in, written as a vikunjaTask
+ * resource named `get-<id>`. Not `task-<id>`: that name records this
+ * model's own last write, which the recent-edit guard trusts, and a read
+ * must never make someone else's edit look like ours.
+ */
+async function getTask(
+  args: z.infer<typeof GetTaskArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const task = await readTask(g, args.taskId);
+  const title = await bucketTitleOf(g, projectId, viewId, args.taskId);
+  const handle = await ctx.writeResource(
+    "vikunjaTask",
+    `get-${args.taskId}`,
+    toVikunjaTask({
+      ...task,
+      bucket: title === null
+        ? null
+        : { title, role: roleOf(title, g.bucketRoles) },
+    }, fetchedAt),
+  );
+  ctx.logger?.info(`Task ${args.taskId}: in "${title}"`);
+  return { dataHandles: [handle] };
+}
+
 /** Bucket title a task currently sits in on the project's kanban view. */
 async function bucketTitleOf(
   g: GlobalArgs,
@@ -1626,12 +2233,17 @@ async function setDueDate(
     );
   }
 
-  const full = await vreq(g, "GET", `/tasks/${args.taskId}`) as Record<
-    string,
-    unknown
-  >;
-  if (full.done === true) {
-    throw new Error(`Task ${args.taskId} is done; not touching a done card.`);
+  const full = await readTask(g, args.taskId);
+  await guardWrite(g, ctx, full, args.force);
+  if (
+    wanted === null && !args.force &&
+    roleOf(bucketBefore, g.bucketRoles) === "waiting"
+  ) {
+    throw new Error(
+      `Refusing to clear task ${args.taskId}'s due date while it is in ` +
+        `"${bucketBefore}": a waiting card needs one. Move it first, or ` +
+        `pass force: true.`,
+    );
   }
   const before = dueDateOf(full.due_date);
   if (
@@ -1692,21 +2304,30 @@ async function guardWrite(
   task: Record<string, unknown>,
   force: boolean,
 ): Promise<void> {
+  const problem = await guardProblem(g, ctx, task, force);
+  if (problem !== null) throw new Error(problem);
+}
+
+/** guardWrite's check without the throw: the refusal message, or null. */
+async function guardProblem(
+  g: GlobalArgs,
+  ctx: ExecCtx,
+  task: { id?: unknown; done?: unknown; updated?: unknown },
+  force: boolean,
+): Promise<string | null> {
   const id = task.id;
   if (task.done === true) {
-    throw new Error(`Task ${id} is done; not touching a done card.`);
+    return `Task ${id} is done; not touching a done card.`;
   }
   const minutes = g.policy.recentEditMinutes;
-  if (force || minutes === 0 || typeof task.updated !== "string") return;
+  if (force || minutes === 0 || typeof task.updated !== "string") return null;
   const age = Date.now() - Date.parse(task.updated);
-  if (!Number.isFinite(age) || age >= minutes * 60_000) return;
+  if (!Number.isFinite(age) || age >= minutes * 60_000) return null;
   const ours = await ctx.readResource?.(`task-${id}`).catch(() => null);
-  if (ours && ours.updated === task.updated) return;
-  throw new Error(
-    `Task ${id} was updated ${task.updated} (less than ${minutes} min ago) ` +
-      `by something other than this model; someone may be editing it. ` +
-      `Pass force: true to write anyway.`,
-  );
+  if (ours && ours.updated === task.updated) return null;
+  return `Task ${id} was updated ${task.updated} (less than ${minutes} min ago) ` +
+    `by something other than this model; someone may be editing it. ` +
+    `Pass force: true to write anyway.`;
 }
 
 /** Where a card sits now; throws when it is not on the view at all. */
@@ -1888,6 +2509,22 @@ async function moveTask(
   if (from.toLowerCase() === target.title.toLowerCase()) {
     ctx.logger?.info(`Task ${args.taskId}: already in "${from}"`);
   } else {
+    // The same rules audit applies to the column: a card is only promoted
+    // into the ready column when it passes the Definition of Ready, and
+    // only parked in waiting with a due date.
+    const problems = readinessProblems(
+      cardStateOf(task),
+      roleOf(target.title, g.bucketRoles),
+      g.policy,
+      { intent: "move" },
+    );
+    if (problems.length && !args.force) {
+      throw new Error(
+        `Refusing to move task ${args.taskId} into "${target.title}": ` +
+          `${formatProblems(problems)}. Fix the card first, or pass ` +
+          `force: true.`,
+      );
+    }
     await moveTaskToBucket(g, projectId, viewId, target.id, args.taskId);
     const now = await bucketTitleOf(g, projectId, viewId, args.taskId);
     if (now !== target.title) {
@@ -2091,13 +2728,517 @@ async function reorder(
 }
 
 // ============================================================================
+// apply_plan — validate a batch against the live board, then run it
+// ============================================================================
+
+/** A card as the plan will have left it after the ops before this one. */
+interface ProjectedCard extends CardState {
+  id: number;
+  bucket: string;
+  done: boolean;
+  updated: string;
+  /** Index of the op that closes it, once one has. */
+  closedBy: number | null;
+  /** Whether the recent-edit guard has already been checked in this plan. */
+  guarded: boolean;
+}
+
+interface ValidatedOp {
+  index: number;
+  op: PlanOp;
+  taskId: number | null;
+  title: string | null;
+  problems: string[];
+  /** A create skipped because its title exists (duplicateTitle: skip). */
+  skip: boolean;
+}
+
+/**
+ * Phase 1: check every op against one read of the board (and, when any op
+ * names labels, one read of the labels), simulating the ops in order so
+ * that each is judged on the state the earlier ones leave. Collects every
+ * problem rather than stopping at the first. Reads only.
+ */
+async function validatePlan(
+  g: GlobalArgs,
+  ctx: ExecCtx,
+  args: ApplyPlanArgs,
+  board: BoardBucket[],
+): Promise<{ ops: ValidatedOp[]; planProblems: string[] }> {
+  const planProblems: string[] = [];
+  if (args.ops.length > args.maxOps) {
+    planProblems.push(
+      `plan has ${args.ops.length} ops, more than maxOps ${args.maxOps}`,
+    );
+  }
+
+  const bucketsByName = new Map(
+    board.map((b) => [b.title.toLowerCase(), b.title]),
+  );
+  const bucketList = board.map((b) => `"${b.title}"`).join(", ");
+  const cards = new Map<number, ProjectedCard>();
+  for (const b of board) {
+    const inDone = roleOf(b.title, g.bucketRoles) === "done";
+    for (const t of b.tasks) {
+      cards.set(t.id, {
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        labels: [...t.labels],
+        priority: t.priority,
+        dueDate: t.dueDate,
+        bucket: b.title,
+        done: t.done || inDone,
+        updated: t.updated,
+        closedBy: null,
+        guarded: false,
+      });
+    }
+  }
+  const needsLabels = args.ops.some((o) =>
+    (o.op === "create" && o.labels.length > 0) || o.op === "labels"
+  );
+  const known = needsLabels ? await fetchAllLabels(g) : new Map();
+  const unknownLabels = (names: string[]) =>
+    names.filter((n) => !known.has(n.toLowerCase()));
+  const plannedTitles: Array<{ index: number; title: string }> = [];
+
+  const out: ValidatedOp[] = [];
+  for (const [index, op] of args.ops.entries()) {
+    const problems: string[] = [];
+    const v: ValidatedOp = {
+      index,
+      op,
+      taskId: op.op === "create" ? null : op.taskId,
+      title: op.op === "create" ? op.title : null,
+      problems,
+      skip: false,
+    };
+    out.push(v);
+
+    if (op.op === "create") {
+      const bucketName = op.bucketName ?? g.defaultBucketName;
+      let bucket: string | null = null;
+      if (bucketName) {
+        bucket = bucketsByName.get(bucketName.toLowerCase()) ?? null;
+        if (bucket === null) {
+          problems.push(
+            `unknown bucket "${bucketName}"; available: ${bucketList}`,
+          );
+        }
+      }
+      const missing = unknownLabels(op.labels);
+      if (missing.length) {
+        problems.push(`unknown label(s): ${missing.join(", ")}`);
+      }
+      const due = op.dueDate?.trim() ? op.dueDate.trim() : null;
+      if (due !== null && !Number.isFinite(Date.parse(due))) {
+        problems.push(`dueDate is not a parseable instant: ${op.dueDate}`);
+      }
+      const labels = op.labels.map((n) =>
+        known.get(n.toLowerCase())?.title ?? n
+      );
+      for (
+        const p of readinessProblems(
+          {
+            title: op.title,
+            description: op.description ?? "",
+            labels,
+            priority: op.priority ?? 0,
+            dueDate: due,
+          },
+          bucket ? roleOf(bucket, g.bucketRoles) : "other",
+          g.policy,
+          {
+            intent: "create",
+            requireReady: op.requireReady ?? args.requireReady,
+          },
+        )
+      ) problems.push(`${p.rule} (${p.detail})`);
+      if (op.duplicateTitle !== "allow") {
+        const open = [...cards.values()].find((c) =>
+          !c.done && c.closedBy === null && sameTitle(c.title, op.title)
+        );
+        const earlier = plannedTitles.find((t) => sameTitle(t.title, op.title));
+        if (earlier) {
+          problems.push(
+            `duplicates the title of op #${earlier.index} in this plan`,
+          );
+        } else if (open && op.duplicateTitle === "refuse") {
+          problems.push(`open task ${open.id} already has this title`);
+        } else if (open) {
+          v.skip = true;
+          v.taskId = open.id;
+        }
+      }
+      if (!v.skip) plannedTitles.push({ index, title: op.title });
+      continue;
+    }
+
+    // Every other op targets an existing card.
+    const card = cards.get(op.taskId);
+    if (!card) {
+      problems.push(`task ${op.taskId} is not on the board`);
+      continue;
+    }
+    v.title = card.title;
+    if (card.closedBy !== null) {
+      problems.push(`task ${card.id} is closed by op #${card.closedBy} first`);
+      continue;
+    }
+
+    if (op.op === "close") {
+      if (!op.humanInstructed) {
+        problems.push("close needs humanInstructed: true on the op");
+      }
+      card.closedBy = index;
+      continue;
+    }
+
+    // update / labels / move / due: the same guard as the single methods,
+    // checked against the board once per card (later ops on the same card
+    // run after this plan's own write, which the guard exempts).
+    if (card.done) {
+      problems.push(`task ${card.id} is done; not touching a done card`);
+      continue;
+    }
+    if (!card.guarded) {
+      const guard = await guardProblem(g, ctx, card, op.force);
+      if (guard !== null) problems.push(guard);
+      card.guarded = true;
+    }
+
+    if (op.op === "update") {
+      if (
+        op.title === undefined && op.description === undefined &&
+        op.priority === undefined
+      ) {
+        problems.push(
+          "update needs at least one of title, description, priority",
+        );
+      }
+      if (op.title !== undefined && op.title.trim() === "") {
+        problems.push("title must not be empty");
+      }
+      if (op.description !== undefined && textLength(op.description) === 0) {
+        problems.push("refusing to write an empty description");
+      }
+      if (op.title !== undefined) card.title = op.title;
+      if (op.description !== undefined) card.description = op.description;
+      if (op.priority !== undefined) card.priority = op.priority;
+    } else if (op.op === "labels") {
+      if (op.add.length + op.remove.length === 0) {
+        problems.push("labels needs at least one label in add or remove");
+      }
+      const adding = new Set(op.add.map((n) => n.toLowerCase()));
+      const both = op.remove.filter((n) => adding.has(n.toLowerCase()));
+      if (both.length) {
+        problems.push(`label(s) in both add and remove: ${both.join(", ")}`);
+      }
+      const missing = unknownLabels([...op.add, ...op.remove]);
+      if (missing.length) {
+        problems.push(`unknown label(s): ${missing.join(", ")}`);
+      }
+      const removing = new Set(op.remove.map((n) => n.toLowerCase()));
+      const kept = card.labels.filter((l) => !removing.has(l.toLowerCase()));
+      for (const n of op.add) {
+        const t = known.get(n.toLowerCase())?.title ?? n;
+        if (!kept.some((l) => l.toLowerCase() === t.toLowerCase())) {
+          kept.push(t);
+        }
+      }
+      card.labels = kept;
+    } else if (op.op === "move") {
+      const target = bucketsByName.get(op.bucketName.toLowerCase());
+      if (target === undefined) {
+        problems.push(
+          `unknown bucket "${op.bucketName}"; available: ${bucketList}`,
+        );
+        continue;
+      }
+      const role = roleOf(target, g.bucketRoles);
+      if (role === "done") {
+        problems.push(
+          `refusing to move into "${target}": use a close op, which needs ` +
+            `humanInstructed: true`,
+        );
+        continue;
+      }
+      if (target !== card.bucket && !op.force) {
+        const ps = readinessProblems(card, role, g.policy, { intent: "move" });
+        if (ps.length) {
+          const later = args.ops.slice(index + 1).findIndex((o) =>
+            o.op !== "create" && o.op !== "close" && o.taskId === card.id
+          );
+          problems.push(
+            `task ${card.id} is not ready for "${target}": ` +
+              formatProblems(ps) +
+              (later >= 0
+                ? ` (op #${index + 1 + later} changes this card later; ` +
+                  `put the move after it)`
+                : ""),
+          );
+        }
+      }
+      card.bucket = target;
+    } else if (op.op === "due") {
+      const due = op.dueDate?.trim() ? op.dueDate.trim() : null;
+      if (due !== null && !Number.isFinite(Date.parse(due))) {
+        problems.push(`dueDate is not a parseable instant: ${op.dueDate}`);
+      }
+      if (
+        due === null && !op.force &&
+        roleOf(card.bucket, g.bucketRoles) === "waiting"
+      ) {
+        problems.push(
+          `refusing to clear the due date of task ${card.id} while it is in ` +
+            `"${card.bucket}": a waiting card needs one`,
+        );
+      }
+      card.dueDate = due;
+    }
+  }
+  return { ops: out, planProblems };
+}
+
+/**
+ * Validate a batch of card operations against the live board and, with
+ * apply: true and no problems at all, run them in order through the same
+ * internals as the single methods (so every write is read back and
+ * recorded as task-<id>, and the recent-edit guard sees them as ours).
+ * Always records the outcome as the planResult resource `plan-<project>`.
+ */
+async function applyPlan(
+  args: ApplyPlanArgs,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const plannedAt = new Date().toISOString();
+  const projectId = args.projectId ?? g.projectId;
+  const viewId = await requireKanbanView(g, projectId);
+  const board = await fetchBoard(g, projectId, viewId);
+  if (board.length === 0) {
+    throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
+  }
+
+  const { ops, planProblems } = await validatePlan(g, ctx, args, board);
+  const problems: PlanResult["problems"] = [
+    ...planProblems.map((problem) => ({
+      index: null,
+      op: null,
+      taskId: null,
+      problem,
+    })),
+    ...ops.flatMap((v) =>
+      v.problems.map((problem) => ({
+        index: v.index,
+        op: v.op.op,
+        taskId: v.taskId,
+        problem,
+      }))
+    ),
+  ];
+  const valid = problems.length === 0;
+  const results: PlanResult["ops"] = ops.map((v) => ({
+    index: v.index,
+    op: v.op.op,
+    taskId: v.taskId,
+    title: v.title,
+    status: v.problems.length ? "invalid" : v.skip ? "skip" : "ok",
+    problems: v.problems,
+  }));
+
+  const handles: unknown[] = [];
+  let outcome: PlanResult["outcome"] = args.apply
+    ? (valid ? "applied" : "refused")
+    : "dry-run";
+  let failure: string | null = null;
+
+  if (args.apply && valid) {
+    // Capture what each single-method run records, to learn created ids.
+    let lastTask: Record<string, unknown> | null = null;
+    const runCtx: ExecCtx = {
+      ...ctx,
+      writeResource: async (spec, name, payload) => {
+        if (spec === "vikunjaTask") {
+          lastTask = payload as Record<string, unknown>;
+        }
+        const h = await ctx.writeResource(spec, name, payload);
+        handles.push(h);
+        return h;
+      },
+    };
+    for (const [i, v] of ops.entries()) {
+      if (v.skip) continue;
+      const op = v.op;
+      lastTask = null;
+      try {
+        await runOp(op, projectId, args, runCtx);
+        results[i].status = "done";
+        const got = lastTask as Record<string, unknown> | null;
+        if (op.op === "create" && got && typeof got.id === "number") {
+          results[i].taskId = got.id;
+        }
+      } catch (e) {
+        failure = e instanceof Error ? e.message : String(e);
+        results[i].status = "failed";
+        results[i].error = failure;
+        for (const later of results.slice(i + 1)) {
+          if (later.status !== "skip") later.status = "not-run";
+        }
+        outcome = "failed";
+        break;
+      }
+    }
+  }
+
+  const count = (st: PlanResult["ops"][number]["status"]) =>
+    results.filter((r) => r.status === st).length;
+  const result = PlanResultSchema.parse({
+    projectId,
+    viewId,
+    plannedAt,
+    outcome,
+    valid,
+    counts: {
+      ops: results.length,
+      problems: problems.length,
+      done: count("done"),
+      failed: count("failed"),
+      notRun: count("not-run"),
+      skipped: count("skip"),
+    },
+    problems,
+    ops: results,
+  });
+  handles.push(
+    await ctx.writeResource("planResult", `plan-${projectId}`, result),
+  );
+
+  const listed = problems.map((p) =>
+    `${p.index === null ? "plan" : `op #${p.index} (${p.op}`}` +
+    `${p.taskId !== null ? ` task ${p.taskId}` : ""}` +
+    `${p.index === null ? "" : ")"}: ${p.problem}`
+  );
+  if (outcome === "refused") {
+    throw new Error(
+      `apply_plan wrote nothing: ${problems.length} problem(s) —\n` +
+        listed.join("\n"),
+    );
+  }
+  if (outcome === "failed") {
+    const ids = (st: string) =>
+      results.filter((r) => r.status === st).map((r) => `#${r.index}`)
+        .join(", ") || "none";
+    const at = results.find((r) => r.status === "failed")!;
+    throw new Error(
+      `apply_plan stopped at op #${at.index} (${at.op}): ${failure}\n` +
+        `done: ${ids("done")}; failed: #${at.index}; not run: ` +
+        `${ids("not-run")}`,
+    );
+  }
+  if (!valid) {
+    for (const line of listed) ctx.logger?.warning(line);
+  }
+  ctx.logger?.info(
+    `apply_plan ${outcome}: ${results.length} op(s), ` +
+      `${problems.length} problem(s), ${count("done")} done, ` +
+      `${count("skip")} skipped`,
+  );
+  return { dataHandles: handles };
+}
+
+/** Run one plan op through the matching single method. */
+async function runOp(
+  op: PlanOp,
+  projectId: number,
+  args: ApplyPlanArgs,
+  ctx: ExecCtx,
+): Promise<void> {
+  switch (op.op) {
+    case "create":
+      await newTask(
+        NewTaskArgsSchema.parse({
+          title: op.title,
+          projectId,
+          description: op.description,
+          labels: op.labels,
+          priority: op.priority,
+          dueDate: op.dueDate,
+          bucketName: op.bucketName,
+          duplicateTitle: op.duplicateTitle,
+          requireReady: op.requireReady ?? args.requireReady,
+        }),
+        ctx,
+      );
+      return;
+    case "update":
+      await updateTask(
+        UpdateTaskArgsSchema.parse({
+          taskId: op.taskId,
+          title: op.title,
+          description: op.description,
+          priority: op.priority,
+          projectId,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "labels":
+      await setLabels(
+        SetLabelsArgsSchema.parse({
+          taskId: op.taskId,
+          add: op.add,
+          remove: op.remove,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "move":
+      await moveTask(
+        MoveTaskArgsSchema.parse({
+          taskId: op.taskId,
+          bucketName: op.bucketName,
+          projectId,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "due":
+      await setDueDate(
+        SetDueDateArgsSchema.parse({
+          taskId: op.taskId,
+          dueDate: op.dueDate ?? "",
+          projectId,
+          force: op.force,
+        }),
+        ctx,
+      );
+      return;
+    case "close":
+      await closeTask(
+        CloseTaskArgsSchema.parse({
+          taskId: op.taskId,
+          humanInstructed: op.humanInstructed,
+          projectId,
+        }),
+        ctx,
+      );
+      return;
+  }
+}
+
+// ============================================================================
 // Model
 // ============================================================================
 
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.27.1",
+  version: "2026.09.27.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2188,6 +3329,25 @@ export const model = {
         "the same way. Existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.09.27.2",
+      description:
+        "Added apply_plan (validate a batch of create/update/labels/move/" +
+        "due/close ops against one read of the board, dry run by default; " +
+        "apply: true writes nothing unless every op is valid, then runs " +
+        "them in order and records a planResult resource), board (every " +
+        "open card as a boardSnapshot resource) and get_task (one card and " +
+        "its bucket as get-<id>). The Definition-of-Ready rules are shared " +
+        "by audit and the writes: new_task refuses a card that does not " +
+        "meet its target bucket's rules (ready: full DoR; waiting: a due " +
+        "date; doing/review/done: never), gains requireReady and " +
+        "duplicateTitle (refuse/skip/allow, case-insensitive; default skip " +
+        "as before, skipIfTitleExists kept as an alias), and reads back " +
+        "every field; move_task enforces the same rules for ready and " +
+        "waiting; set_due_date gains the recent-edit guard and force. " +
+        "Existing model attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     vikunjaTask: {
@@ -2226,6 +3386,22 @@ export const model = {
       schema: DueReportSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
+    },
+    planResult: {
+      description:
+        "One apply_plan run: the outcome (dry-run / refused / applied / " +
+        "failed), every validation problem, and each op's status.",
+      schema: PlanResultSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    boardSnapshot: {
+      description:
+        "Every not-done card on a board with its bucket, role, labels, " +
+        "priority, due date, timestamps and full description.",
+      schema: BoardSnapshotSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
     },
   },
   methods: {
@@ -2266,7 +3442,9 @@ export const model = {
         "Reads the full task, writes it back with only due_date changed " +
         "(Vikunja's POST /tasks/{id} is a full replace), re-reads and " +
         "asserts the date took and the card is still in the same bucket. " +
-        "Refuses done cards. Records the task as a vikunjaTask resource.",
+        "Refuses done cards, cards someone else updated within " +
+        "policy.recentEditMinutes, and clearing the date of a waiting card, " +
+        "unless force: true. Records the task as a vikunjaTask resource.",
       arguments: SetDueDateArgsSchema,
       execute: setDueDate,
     },
@@ -2277,8 +3455,14 @@ export const model = {
         '(default "Backlog", override with bucketName) so it lands in a ' +
         "backlog column rather than the view's default working column. " +
         "Optionally attaches existing labels by title (label and/or " +
-        "labels; all resolved before anything is created) and skips " +
-        "creation if a non-done task with the same title already exists.",
+        "labels; all resolved before anything is created). Refuses, with " +
+        "nothing created, a card that does not meet the readiness rules of " +
+        "its target bucket (ready: full Definition of Ready; waiting: a due " +
+        "date; doing/review/done: never) or of requireReady. duplicateTitle " +
+        "(refuse/skip/allow, default skip) handles an open card with the " +
+        "same title, case-insensitively. Reads back title, description, " +
+        "priority, due date, labels and bucket; a mismatch is an error " +
+        "naming the task id.",
       arguments: NewTaskArgsSchema,
       execute: newTask,
     },
@@ -2307,7 +3491,10 @@ export const model = {
     move_task: {
       description:
         "Move one card into a named bucket and read its placement back " +
-        "from the kanban view. Refuses the done bucket (use close_task), " +
+        "from the kanban view. Moving into the ready bucket requires the " +
+        "full Definition of Ready, and into waiting a due date (refusal " +
+        "lists the findings; force: true overrides). Refuses the done " +
+        "bucket (use close_task), " +
         "done cards, and cards someone else updated within " +
         "policy.recentEditMinutes unless force: true. Run it after any " +
         "field edits: a full-replace write can drop a card out of its " +
@@ -2322,6 +3509,37 @@ export const model = {
         "closing a card is a person's decision.",
       arguments: CloseTaskArgsSchema,
       execute: closeTask,
+    },
+    apply_plan: {
+      description:
+        "Batch card writes in one run. Validates EVERY op (create, update, " +
+        "labels, move, due, close) against one read of the board and the " +
+        "labels — unknown or done cards, the recent-edit guard, unknown " +
+        "labels or buckets, readiness for creates and moves (judged on the " +
+        "state earlier ops leave), duplicate titles on the board or within " +
+        "the plan, ops after a close, close without humanInstructed — and " +
+        "collects every problem. Dry run by default: writes only the " +
+        "planResult resource. With apply: true it writes nothing unless " +
+        "there are no problems, then runs the ops in order through the " +
+        "single methods (each read back), stopping at the first failure.",
+      arguments: ApplyPlanArgsSchema,
+      execute: applyPlan,
+    },
+    board: {
+      description:
+        "Read-only: write every not-done card on the project's kanban " +
+        "board (id, title, full description, bucket and its role, labels, " +
+        "priority, due date, updated) as one boardSnapshot resource, read " +
+        "page by page so no bucket is truncated.",
+      arguments: BoardArgsSchema,
+      execute: boardMethod,
+    },
+    get_task: {
+      description:
+        "Read-only: one card plus the bucket (and role) it sits in, " +
+        "written as the vikunjaTask resource get-<id>.",
+      arguments: GetTaskArgsSchema,
+      execute: getTask,
     },
     list_recent: {
       description:
