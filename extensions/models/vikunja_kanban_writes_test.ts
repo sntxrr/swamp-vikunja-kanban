@@ -585,6 +585,56 @@ Deno.test("recent-edit guard: someone else's edit blocks, ours and force pass", 
   assertStrictEquals(f.tasks.get(id)!.priority, 3);
 });
 
+// ------------------------------------------------------------ set_due_date
+
+Deno.test("set_due_date: recent-edit guard blocks, force and our own write pass", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed({ updated: new Date().toISOString() });
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () =>
+        run("set_due_date", { taskId: id, dueDate: "2026-11-04T17:00:00Z" }),
+      Error,
+      "force: true",
+    );
+    assertEquals(f.writes, []);
+    await run("set_due_date", {
+      taskId: id,
+      dueDate: "2026-11-04T17:00:00Z",
+      force: true,
+    });
+    // Recorded as ours: the next change needs no force.
+    await run("set_due_date", { taskId: id, dueDate: "2026-11-05T17:00:00Z" });
+  });
+  assertStrictEquals(f.tasks.get(id)!.due_date, "2026-11-05T17:00:00Z");
+});
+
+Deno.test("set_due_date refuses done cards and clearing a waiting card's date", async () => {
+  const f = new FakeVikunja();
+  const done = f.seed({ done: true, bucket: 13 });
+  const waiting = f.seed({ bucket: 14, due_date: "2026-11-04T17:00:00Z" });
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () =>
+        run("set_due_date", { taskId: done, dueDate: "2026-11-04T17:00:00Z" }),
+      Error,
+      "is done",
+    );
+    await assertRejects(
+      () => run("set_due_date", { taskId: waiting, dueDate: "" }),
+      Error,
+      "waiting card needs one",
+    );
+    assertEquals(f.writes, []);
+    // Re-dating a waiting card is fine.
+    await run("set_due_date", {
+      taskId: waiting,
+      dueDate: "2026-12-01T17:00:00Z",
+    });
+  });
+  assertStrictEquals(f.tasks.get(waiting)!.due_date, "2026-12-01T17:00:00Z");
+});
+
 // -------------------------------------------------------------- set_labels
 
 Deno.test("set_labels adds and removes by title, case-insensitively", async () => {

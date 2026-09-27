@@ -403,6 +403,11 @@ const SetDueDateArgsSchema = z.object({
     "Project whose kanban view is read to assert the card's bucket did not " +
       "change. Defaults to the configured projectId.",
   ),
+  force: z.boolean().default(false).describe(
+    "Write even though the card was updated within " +
+      "policy.recentEditMinutes by something other than this model, or " +
+      "clear the due date of a card in the waiting bucket.",
+  ),
 });
 
 const TaskId = z.number().int().positive().describe("Vikunja task id.");
@@ -1941,12 +1946,17 @@ async function setDueDate(
     );
   }
 
-  const full = await vreq(g, "GET", `/tasks/${args.taskId}`) as Record<
-    string,
-    unknown
-  >;
-  if (full.done === true) {
-    throw new Error(`Task ${args.taskId} is done; not touching a done card.`);
+  const full = await readTask(g, args.taskId);
+  await guardWrite(g, ctx, full, args.force);
+  if (
+    wanted === null && !args.force &&
+    roleOf(bucketBefore, g.bucketRoles) === "waiting"
+  ) {
+    throw new Error(
+      `Refusing to clear task ${args.taskId}'s due date while it is in ` +
+        `"${bucketBefore}": a waiting card needs one. Move it first, or ` +
+        `pass force: true.`,
+    );
   }
   const before = dueDateOf(full.due_date);
   if (
@@ -2597,7 +2607,9 @@ export const model = {
         "Reads the full task, writes it back with only due_date changed " +
         "(Vikunja's POST /tasks/{id} is a full replace), re-reads and " +
         "asserts the date took and the card is still in the same bucket. " +
-        "Refuses done cards. Records the task as a vikunjaTask resource.",
+        "Refuses done cards, cards someone else updated within " +
+        "policy.recentEditMinutes, and clearing the date of a waiting card, " +
+        "unless force: true. Records the task as a vikunjaTask resource.",
       arguments: SetDueDateArgsSchema,
       execute: setDueDate,
     },
