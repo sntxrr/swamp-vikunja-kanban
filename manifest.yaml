@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.09.27.4"
+version: "2026.10.14.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -63,6 +63,7 @@ description: |
   The edit methods (update_task, set_labels, move_task, set_due_date)
   refuse done cards and cards someone else updated within
   policy.recentEditMinutes unless force: true.
+license: MIT
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
 paths:
   base: manifest
