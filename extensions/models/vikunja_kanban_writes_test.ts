@@ -46,6 +46,12 @@ class FakeVikunja {
   tasks = new Map<number, Task>();
   taskLabels = new Map<number, Set<number>>();
   bucketOf = new Map<number, number>();
+  /** View-20 positions; a card without one sits at its id, as before. */
+  positions = new Map<number, number>();
+  /** Answer the next N non-recalculating position writes with a 4028. */
+  fail4028 = 0;
+  /** How many full recalculations a position write triggered. */
+  recalculations = 0;
   nextId = 100;
   /** Simulate a full-replace write dropping the card into the first bucket. */
   unbucketOnWrite = false;
@@ -83,6 +89,57 @@ class FakeVikunja {
       this.labels.find((x) => x.id === l)!
     );
     return { ...t, labels: labels.length ? labels : null };
+  }
+
+  pos(id: number): number {
+    return this.positions.get(id) ?? id;
+  }
+
+  /**
+   * Vikunja v2.6 updateTaskPosition: below MinPositionSpacing (0.01) the
+   * whole view is respaced over 2^32 in (position, id) order; an exact
+   * collision is spread inside the neighbours' gap, or refused with 4028
+   * when that gap leaves less than 0.01 per card.
+   */
+  setPosition(id: number, position: number): [number, unknown] {
+    const MIN = 0.01;
+    this.positions.set(id, position);
+    if (position < MIN) {
+      this.recalculations++;
+      const ids = [...this.bucketOf.keys()].sort((a, b) =>
+        this.pos(a) - this.pos(b) || a - b
+      );
+      ids.forEach((tid, i) =>
+        this.positions.set(tid, (2 ** 32 / ids.length) * (i + 1))
+      );
+      return [200, {}];
+    }
+    if (this.fail4028 > 0) {
+      this.fail4028--;
+      return [500, {
+        code: 4028,
+        message: "Position repair requires full view recalculation.",
+      }];
+    }
+    const all = [...this.bucketOf.keys()];
+    const clash = all.filter((t) => this.pos(t) === position);
+    if (clash.length > 1) {
+      const below = all.map((t) => this.pos(t)).filter((p) => p < position);
+      const above = all.map((t) => this.pos(t)).filter((p) => p > position);
+      const lo = below.length ? Math.max(...below) : 0;
+      const hi = above.length ? Math.min(...above) : 2 ** 32;
+      const step = (hi - lo) / (clash.length + 1);
+      if (step < MIN) {
+        return [500, {
+          code: 4028,
+          message: "Position repair requires full view recalculation.",
+        }];
+      }
+      clash.sort((a, b) => a - b).forEach((t, i) =>
+        this.positions.set(t, lo + step * (i + 1))
+      );
+    }
+    return [200, {}];
   }
 
   touch(id: number) {
@@ -124,7 +181,8 @@ class FakeVikunja {
         this.buckets.map((b) => ({
           ...b,
           tasks: [...this.bucketOf].filter(([, bid]) => bid === b.id)
-            .map(([tid]) => ({ ...this.view(tid), position: tid })),
+            .map(([tid]) => ({ ...this.view(tid), position: this.pos(tid) }))
+            .sort((x, y) => x.position - y.position || x.id - y.id),
         })),
       ];
     }
@@ -157,6 +215,12 @@ class FakeVikunja {
           ),
         ),
       ];
+    }
+    if (method === "POST" && (m = path.match(/^\/tasks\/(\d+)\/position$/))) {
+      return this.setPosition(
+        Number(m[1]),
+        (body as { position: number }).position,
+      );
     }
     if ((m = path.match(/^\/tasks\/(\d+)$/))) {
       const id = Number(m[1]);
@@ -1203,6 +1267,71 @@ Deno.test("apply_plan: maxOps cap, and duplicateTitle skip leaves the op out", a
     assertEquals(r.ops[0].status, "skip");
     assertEquals(r.ops[0].taskId, existing);
   });
+  assertEquals(f.writes, []);
+});
+
+// ---------------------------------------------------------------- reorder
+
+/** Three Backlog cards whose priorities put them in reverse order. */
+function outOfOrder(f: FakeVikunja, positions: number[]): number[] {
+  const ids = [1, 2, 3].map((p) => f.seed({ priority: p }));
+  ids.forEach((id, i) => f.positions.set(id, positions[i]));
+  return ids;
+}
+const backlogOrder = (f: FakeVikunja) =>
+  [...f.bucketOf].filter(([, b]) => b === 10).map(([t]) => t)
+    .sort((a, b) => f.pos(a) - f.pos(b) || a - b);
+
+Deno.test("reorder respaces a cramped view before moving, then converges", async () => {
+  const f = new FakeVikunja();
+  const [p1, p2, p3] = outOfOrder(f, [0.011, 0.012, 0.013]);
+  await withFake(f, async (run, store) => {
+    await run("reorder", { apply: true });
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, true);
+    assertStrictEquals(plan.recalculations, 1);
+  });
+  assertStrictEquals(f.recalculations, 1);
+  assertEquals(backlogOrder(f), [p3, p2, p1]);
+});
+
+Deno.test("reorder recovers from a Vikunja 4028 with one recalculation", async () => {
+  const f = new FakeVikunja();
+  const [p1, p2, p3] = outOfOrder(f, [1000, 2000, 3000]);
+  f.fail4028 = 1;
+  await withFake(f, async (run, store) => {
+    await run("reorder", { apply: true });
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, true);
+    assertStrictEquals(plan.recalculations, 1);
+  });
+  assertEquals(backlogOrder(f), [p3, p2, p1]);
+});
+
+Deno.test("reorder gives up when 4028 persists straight after a recalculation", async () => {
+  const f = new FakeVikunja();
+  outOfOrder(f, [1000, 2000, 3000]);
+  f.fail4028 = 99;
+  await withFake(f, async (run) => {
+    await assertRejects(
+      () => run("reorder", { apply: true }),
+      Error,
+      "straight after a full position recalculation",
+    );
+  });
+  assertStrictEquals(f.recalculations, 1);
+});
+
+Deno.test("a reorder dry run never recalculates", async () => {
+  const f = new FakeVikunja();
+  outOfOrder(f, [0.011, 0.012, 0.013]);
+  await withFake(f, async (run, store) => {
+    await run("reorder", {});
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.recalculations, 0);
+    assertStrictEquals((plan.moves as unknown[]).length, 2);
+  });
+  assertStrictEquals(f.recalculations, 0);
   assertEquals(f.writes, []);
 });
 

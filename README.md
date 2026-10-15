@@ -135,6 +135,8 @@ swamp model method run homelab-backlog reorder --arg apply=true --arg 'buckets=[
 
 With `apply=true` it moves **one card at a time** — read the bucket, move the first card that is out of place to the midpoint of its intended neighbours (`POST /tasks/{id}/position`), re-read, repeat — and fails if the board has not converged within `maxIterations`. It works this way because Vikunja re-derives positions on write, so a batch of absolute positions drifts (measured: 2 of 39 cards landed in the wrong slot with HTTP 200 on every call). A run that converges ends with a re-read that matches the intended order; a second dry run then reports 0 moves.
 
+Repeated halving eventually leaves no room between two cards. Vikunja v2.6 refuses a position that collides with another card when there is less than its minimum spacing (0.01) to spread them, with HTTP 500 code **4028** ("Position repair requires full view recalculation"), and it has no endpoint for that recalculation. It does run one whenever a position below 0.01 is written. So before a move into a gap narrower than that, and after any 4028, `reorder` writes position 0 for the card that belongs first in the bucket. Vikunja then respaces the whole view, keeping every card's relative order, and the run re-reads and carries on. A second stall straight after a recalculation still fails. The `reorderPlan` resource counts these as `recalculations`.
+
 ### `due_report`
 
 Read-only. Treats a card's **due date as the day to look at it again**: reads the board and splits every dated, not-done card into *overdue*, *due today* and *upcoming* (due within `lookaheadDays`, default 7), by whole UTC calendar day. Writes a `dueReport` resource whose `message` is a ready-to-send Markdown list with a link per card, and `counts.actionable` (overdue + due today) is what a scheduled nudge should gate on.
@@ -249,7 +251,7 @@ globalArguments:
 - `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
 - `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
-- `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `converged`.
+- `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `recalculations`, `converged`.
 - `boardSnapshot` — every open card on a board (see `board`) with per-bucket counts.
 - `planResult` — one `apply_plan` run: outcome, problems, per-op status.
 - `dueReport` — one due-date pass: `overdue`, `dueToday`, `upcoming` (each `id`, `title`, `bucket`, `dueDate`, `daysUntil`, `url`), `counts` (incl. `actionable`), the Markdown `message`, and `boardUrl`.
