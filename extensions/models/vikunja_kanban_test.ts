@@ -7,6 +7,7 @@ import {
   classifyDue,
   dueDateOf,
   intendedOrder,
+  MIN_POSITION_SPACING,
   nextMove,
   readinessProblems,
   renderDueMessage,
@@ -265,6 +266,27 @@ Deno.test("nextMove targets the first wrong slot at the neighbour midpoint", () 
   assertEquals(m.index, 0);
   assertEquals(m.position, 50); // between 0 and 100
   assertStrictEquals(nextMove(intended, intended), null);
+});
+
+Deno.test("nextMove flags a gap too small to halve above Vikunja's spacing", () => {
+  const roomy = [
+    task({ id: 1, priority: 1, position: 100 }),
+    task({ id: 2, priority: 3, position: 200 }),
+  ];
+  assertStrictEquals(
+    nextMove(roomy, intendedOrder(roomy, "oldest"))!.cramped,
+    false,
+  );
+  const tight = [
+    task({ id: 1, priority: 1, position: 0.015 }),
+    task({ id: 2, priority: 3, position: 0.02 }),
+  ];
+  // slot 0 sits between 0 and 0.015: under 2 x MIN_POSITION_SPACING
+  assertStrictEquals(
+    nextMove(tight, intendedOrder(tight, "oldest"))!.cramped,
+    true,
+  );
+  assertStrictEquals(MIN_POSITION_SPACING, 0.01);
 });
 
 Deno.test("nextMove nudges past a collapsed gap instead of dividing by nothing", () => {

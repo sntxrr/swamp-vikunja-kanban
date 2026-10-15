@@ -275,6 +275,10 @@ const ReorderPlanSchema = z.object({
       "order (always false on a dry run that still has pending moves).",
   ),
   iterations: z.number(),
+  recalculations: z.number().default(0).describe(
+    "Full position recalculations the run triggered (a cramped gap or a " +
+      "Vikunja 4028); 0 on a dry run.",
+  ),
   moves: z.array(z.object({
     taskId: z.number(),
     title: z.string(),
@@ -590,7 +594,9 @@ const ReorderArgsSchema = z.object({
     "false (default) only reports the moves that would be made. true " +
       "performs them one at a time — read the bucket, move the first card " +
       "that is out of place to the midpoint of its intended neighbours, " +
-      "re-read, repeat — and fails if the board has not converged.",
+      "re-read, repeat — and fails if the board has not converged. When a " +
+      "gap is too small to halve (or Vikunja answers 4028), it first makes " +
+      "Vikunja respace the whole view, once per stuck move.",
   ),
   buckets: z.array(z.string()).optional().describe(
     "Bucket titles (case-insensitive) to reorder. Default: every bucket " +
@@ -1853,15 +1859,30 @@ export function auditBucket(
 }
 
 /**
+ * Vikunja v2.6's MinPositionSpacing (pkg/models/task_position.go). A position
+ * POST that collides with another card's position and has less room than
+ * this to spread them fails with 500 code 4028 ("Position repair requires
+ * full view recalculation"); one below it makes Vikunja respace the view.
+ */
+export const MIN_POSITION_SPACING = 0.01;
+
+/**
  * The single move that brings a bucket one step closer to `intended`: the
  * first slot whose occupant is wrong gets the card that belongs there,
  * positioned at the midpoint of its new neighbours. Returns null when the
- * bucket is already in order.
+ * bucket is already in order. `cramped` means the midpoint would sit closer
+ * than MIN_POSITION_SPACING to a neighbour: repeated halving has used up the
+ * gap, and the view needs respacing before the move can land reliably.
  */
 export function nextMove(
   current: BoardTask[],
   intended: BoardTask[],
-): { task: BoardTask; index: number; position: number } | null {
+): {
+  task: BoardTask;
+  index: number;
+  position: number;
+  cramped: boolean;
+} | null {
   for (let i = 0; i < intended.length; i++) {
     if (current[i]?.id === intended[i].id) continue;
     const task = intended[i];
@@ -1870,9 +1891,32 @@ export function nextMove(
     // Vikunja re-derives positions on write, so a collapsed gap is not
     // fatal — nudge past `lo` and let the re-read decide.
     const position = hi > lo ? (lo + hi) / 2 : lo + 1;
-    return { task, index: i, position };
+    const cramped = !(hi - lo >= 2 * MIN_POSITION_SPACING);
+    return { task, index: i, position, cramped };
   }
   return null;
+}
+
+/** Whether an error is Vikunja's 4028 "needs full view recalculation". */
+function isNeedsRecalculation(err: unknown): boolean {
+  return err instanceof Error && /"code":\s*4028\b/.test(err.message);
+}
+
+/**
+ * Make Vikunja respace every position in the view. v2.6 has no endpoint for
+ * this, but its position update runs a full RecalculateTaskPositions when the
+ * new position is below MIN_POSITION_SPACING. Sending `taskId` (the card that
+ * belongs first in its bucket) to 0 triggers that and leaves it first, where
+ * it belongs anyway; every other card keeps its relative order.
+ */
+async function recalculatePositions(
+  g: GlobalArgs,
+  viewId: number,
+  taskId: number,
+): Promise<void> {
+  await vreq(g, "POST", `/tasks/${taskId}/position`, {
+    body: { project_view_id: viewId, task_id: taskId, position: 0 },
+  });
 }
 
 async function requireKanbanView(
@@ -2703,8 +2747,29 @@ async function reorder(
   }
 
   let iterations = 0;
+  let recalculations = 0;
   let converged = moves.length === 0;
   if (args.apply && moves.length > 0) {
+    // True between a recalculation and the next successful move: a second
+    // cramped gap or 4028 in that window means respacing did not help.
+    let justRecalculated = false;
+    const recalculate = async (b: BoardBucket, reason: string) => {
+      if (justRecalculated) {
+        throw new Error(
+          `reorder: ${reason} in bucket "${b.title}" straight after a full ` +
+            "position recalculation; giving up.",
+        );
+      }
+      const first = orderOf(b)[0];
+      await recalculatePositions(g, viewId, first.id);
+      recalculations++;
+      justRecalculated = true;
+      ctx.logger?.info(
+        "Recalculated view {viewId} positions ({reason}, via #{taskId})",
+        { viewId, reason, taskId: first.id, bucket: b.title },
+      );
+      board = await fetchBoard(g, projectId, viewId);
+    };
     for (
       const bucketTitle of board.filter((b) => inScope(b.title)).map((b) =>
         b.title
@@ -2717,19 +2782,30 @@ async function reorder(
         }
         const move = nextMove(b.tasks, orderOf(b));
         if (!move) break;
+        if (move.cramped) {
+          await recalculate(b, "gap below minimum spacing");
+          continue;
+        }
         if (iterations >= args.maxIterations) {
           throw new Error(
             `reorder did not converge after ${iterations} moves (bucket "${bucketTitle}" still out of order).`,
           );
         }
         iterations++;
-        await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
-          body: {
-            project_view_id: viewId,
-            task_id: move.task.id,
-            position: move.position,
-          },
-        });
+        try {
+          await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
+            body: {
+              project_view_id: viewId,
+              task_id: move.task.id,
+              position: move.position,
+            },
+          });
+        } catch (err) {
+          if (!isNeedsRecalculation(err)) throw err;
+          await recalculate(b, "Vikunja 4028");
+          continue;
+        }
+        justRecalculated = false;
         ctx.logger?.info("Moved #{taskId} to slot {slot} in {bucket}", {
           taskId: move.task.id,
           slot: move.index,
@@ -2757,6 +2833,7 @@ async function reorder(
     applied: args.apply,
     converged,
     iterations,
+    recalculations,
     moves,
   });
   const handle = await ctx.writeResource(
@@ -2766,8 +2843,9 @@ async function reorder(
   );
   if (args.apply) {
     ctx.logger?.info(
-      "Reordered project {projectId}: {moves} moves, converged={converged}",
-      { projectId, moves: iterations, converged },
+      "Reordered project {projectId}: {moves} moves, {recalculations} " +
+        "recalculation(s), converged={converged}",
+      { projectId, moves: iterations, recalculations, converged },
     );
   } else {
     ctx.logger?.info(
@@ -3342,7 +3420,7 @@ function logged<A>(
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.09.27.4",
+  version: "2026.10.15.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3473,6 +3551,18 @@ export const model = {
         "landed. Records are also written when a run stops mid-way. No " +
         "argument or resource changes; existing model attributes carry " +
         "over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.15.1",
+      description:
+        "reorder no longer fails on Vikunja 500 code 4028 (position repair " +
+        "needs a full view recalculation). Before a move into a gap smaller " +
+        "than Vikunja's minimum spacing, or after a 4028, it makes Vikunja " +
+        "respace the view (a position below 0.01 triggers that), re-reads, " +
+        "and carries on; a second stall straight after a recalculation " +
+        "still fails. The reorderPlan resource gains recalculations " +
+        "(default 0). Existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
