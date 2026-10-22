@@ -15,6 +15,8 @@ type Task = Record<string, unknown> & { id: number };
 interface Label {
   id: number;
   title: string;
+  hex_color?: string;
+  description?: string;
 }
 
 const OLD = "2026-09-01T00:00:00Z";
@@ -31,6 +33,10 @@ class FakeVikunja {
       title: `filler-${String(i + 4).padStart(3, "0")}`,
     })),
   ];
+  /** Every board page adds one more card, and every label page one more label: a list longer than any page cap. */
+  endless = false;
+  /** A label create that "succeeds" but drops hex_color. */
+  dropLabelColor = false;
   /** Simulate a server that ignores `page` and always returns page 1. */
   ignorePage = false;
   /** Every GET, as "path?query", for asserting how lists were paged. */
@@ -48,6 +54,8 @@ class FakeVikunja {
   bucketOf = new Map<number, number>();
   /** View-20 positions; a card without one sits at its id, as before. */
   positions = new Map<number, number>();
+  /** Position writes for these cards answer 200 but are not stored. */
+  stuckPositions = new Set<number>();
   /** Answer the next N non-recalculating position writes with a 4028. */
   fail4028 = 0;
   /** How many full recalculations a position write triggered. */
@@ -103,6 +111,7 @@ class FakeVikunja {
    */
   setPosition(id: number, position: number): [number, unknown] {
     const MIN = 0.01;
+    if (this.stuckPositions.has(id)) return [200, {}];
     this.positions.set(id, position);
     if (position < MIN) {
       this.recalculations++;
@@ -167,7 +176,33 @@ class FakeVikunja {
       return [200, { max_items_per_page: 50 }];
     }
     if (method === "GET" && path === "/labels") {
+      if (this.endless) {
+        const n = Number(url.searchParams.get("page") ?? 1);
+        // Full pages, so the short-page stop never fires.
+        return [
+          200,
+          Array.from({ length: 50 }, (_, i) => ({
+            id: 900_000 + n * 50 + i,
+            title: `endless-${n}-${i}`,
+          })),
+        ];
+      }
       return [200, this.page(url, this.labels)];
+    }
+    if (method === "PUT" && path === "/labels") {
+      const b = body as Partial<Label>;
+      const label: Label = {
+        id: this.labels.reduce((n, l) => Math.max(n, l.id), 0) + 1,
+        title: String(b.title),
+        hex_color: this.dropLabelColor ? "" : b.hex_color ?? "",
+        description: b.description ?? "",
+      };
+      this.labels.push(label);
+      return [201, label];
+    }
+    if (method === "GET" && (m = path.match(/^\/labels\/(\d+)$/))) {
+      const l = this.labels.find((x) => x.id === Number(m![1]));
+      return l ? [200, l] : [404, { message: "label not found" }];
     }
     if (method === "GET" && path === "/projects/5/views") {
       return [200, [{ id: 20, view_kind: "kanban" }]];
@@ -176,13 +211,19 @@ class FakeVikunja {
       return [200, this.buckets];
     }
     if (method === "GET" && path === "/projects/5/views/20/tasks") {
+      const n = Number(url.searchParams.get("page") ?? 1);
       return [
         200,
         this.buckets.map((b) => ({
           ...b,
-          tasks: [...this.bucketOf].filter(([, bid]) => bid === b.id)
-            .map(([tid]) => ({ ...this.view(tid), position: this.pos(tid) }))
-            .sort((x, y) => x.position - y.position || x.id - y.id),
+          tasks: [
+            ...[...this.bucketOf].filter(([, bid]) => bid === b.id)
+              .map(([tid]) => ({ ...this.view(tid), position: this.pos(tid) }))
+              .sort((x, y) => x.position - y.position || x.id - y.id),
+            ...(this.endless && b.id === 10
+              ? [{ id: 900_000 + n, title: `endless ${n}`, position: 1e9 + n }]
+              : []),
+          ],
         })),
       ];
     }
@@ -822,6 +863,165 @@ Deno.test("set_due_date refuses done cards and clearing a waiting card's date", 
   assertStrictEquals(f.tasks.get(waiting)!.due_date, "2026-12-01T17:00:00Z");
 });
 
+// ------------------------------------------------------------ create_label
+
+Deno.test("create_label refuses without humanInstructed and reads nothing", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () => run("create_label", { title: "zz-new" }),
+      Error,
+      "humanInstructed: true",
+    );
+    assertEquals(store.size, 0);
+  });
+  assertEquals(f.writes, []);
+  assertEquals(f.reads, []);
+  assertStrictEquals(f.labels.length, 120);
+});
+
+Deno.test("create_label creates once, reads back, and is idempotent", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run, store) => {
+    await run("create_label", {
+      title: "zz-new",
+      hexColor: "#1973FF",
+      description: "made by a test",
+      humanInstructed: true,
+    });
+    const made = f.labels.find((l) => l.title === "zz-new")!;
+    assertStrictEquals(made.hex_color, "1973ff");
+    const rec = store.get(`label-${made.id}`)!;
+    assertEquals(rec.status, "created");
+    assertEquals(rec.id, made.id);
+    assertEquals(rec.hexColor, "1973ff");
+    assertEquals(f.writes, ["PUT /labels"]);
+    // Every page was read before deciding the title is new.
+    assert(
+      f.reads.some((r) => r.startsWith("/labels?") && r.includes("page=3")),
+    );
+
+    // Same title, other case: the existing label, no second PUT.
+    await run("create_label", { title: "ZZ-New", humanInstructed: true });
+    assertEquals(store.get(`label-${made.id}`)!.status, "exists");
+    assertEquals(f.writes, ["PUT /labels"]);
+  });
+  assertStrictEquals(
+    f.labels.filter((l) => /^zz-new$/i.test(l.title)).length,
+    1,
+  );
+});
+
+Deno.test("create_label finds an existing title beyond the first page", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run, store) => {
+    await run("create_label", { title: "FILLER-110", humanInstructed: true });
+    const rec = store.get("label-110")!;
+    assertEquals(rec.status, "exists");
+    assertEquals(rec.title, "filler-110");
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("create_label fails when the colour does not read back", async () => {
+  const f = new FakeVikunja();
+  f.dropLabelColor = true;
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () =>
+        run("create_label", {
+          title: "zz-colour",
+          hexColor: "abcdef",
+          humanInstructed: true,
+        }),
+      Error,
+      "read back with hex_color",
+    );
+    assertEquals(store.size, 0);
+  });
+});
+
+Deno.test("create_label refuses a bad colour before any request", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run) => {
+    await assertRejects(() =>
+      run("create_label", {
+        title: "zz-x",
+        hexColor: "blue",
+        humanInstructed: true,
+      })
+    );
+  });
+  assertEquals(f.reads, []);
+});
+
+Deno.test("no other method creates labels: unknown ones are still refused", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed();
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", {
+      ops: [{ op: "labels", taskId: id, add: ["no-such-label"] }],
+    });
+    const r = planOf(store);
+    assertEquals(r.outcome, "dry-run");
+    assert(
+      r.ops[0].problems.join(" | ").includes(
+        "unknown label(s): no-such-label",
+      ),
+    );
+    await assertRejects(
+      () => run("new_task", { title: "x", labels: ["no-such-label"] }),
+      Error,
+      "create_label",
+    );
+  });
+  assert(!f.writes.includes("PUT /labels"));
+  assertStrictEquals(f.labels.length, 120);
+});
+
+Deno.test("set_due_date moves the card back when the write un-buckets it", async () => {
+  // Failed on 2026.10.15.1 with "un-bucketed it; move it back by hand".
+  const f = new FakeVikunja();
+  const id = f.seed({ bucket: 14, due_date: "2026-11-04T17:00:00Z" });
+  f.unbucketOnWrite = true;
+  await withFake(f, async (run, store) => {
+    await run("set_due_date", { taskId: id, dueDate: "2026-11-09T17:00:00Z" });
+    // Recorded with the card's latest `updated` (after the move back), so
+    // an edit straight after counts as ours.
+    assertStrictEquals(
+      store.get(`task-${id}`)!.updated,
+      f.tasks.get(id)!.updated,
+    );
+    await run("update_task", { taskId: id, priority: 4 });
+  });
+  assertStrictEquals(bucketTitle(f, id), "Waiting");
+  assertStrictEquals(f.tasks.get(id)!.due_date, "2026-11-09T17:00:00Z");
+  assert(
+    f.logs.some((l) =>
+      l.level === "warning" && l.msg.includes("moved it back")
+    ),
+  );
+});
+
+Deno.test("apply_plan: a due op that un-buckets a card does not stop the pass", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed({ bucket: 14, due_date: "2026-11-04T17:00:00Z" });
+  const b = f.seed({ bucket: 12 });
+  f.unbucketOnWrite = true;
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", {
+      apply: true,
+      ops: [
+        { op: "due", taskId: a, dueDate: "2026-11-10T17:00:00Z" },
+        { op: "update", taskId: b, priority: 4 },
+      ],
+    });
+    assertEquals(planOf(store).outcome, "applied");
+  });
+  assertStrictEquals(bucketTitle(f, a), "Waiting");
+  assertStrictEquals(bucketTitle(f, b), "Doing");
+});
+
 // -------------------------------------------------------------- set_labels
 
 Deno.test("set_labels adds and removes by title, case-insensitively", async () => {
@@ -1335,6 +1535,167 @@ Deno.test("a reorder dry run never recalculates", async () => {
   assertEquals(f.writes, []);
 });
 
+/**
+ * `n` cards in `bucket`, created oldest-last so that, at equal priority,
+ * the bucket is in exactly reverse order (every slot but the middle wrong).
+ * Positions are 65536 apart, so no gap is cramped. Waiting cards get due
+ * dates in the same reverse order.
+ */
+function reversed(f: FakeVikunja, bucket: number, n: number): number[] {
+  const ids: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const created = new Date(Date.UTC(2026, 0, 1) + (n - i) * 3_600_000)
+      .toISOString();
+    const due = new Date(Date.UTC(2026, 10, 1) + (n - i) * 86_400_000)
+      .toISOString();
+    const id = f.seed({
+      bucket,
+      priority: 2,
+      created,
+      ...(bucket === 14 ? { due_date: due } : {}),
+    });
+    f.positions.set(id, 65_536 * (ids.length + 1) + bucket * 1e7);
+    ids.push(id);
+  }
+  return ids;
+}
+const order = (f: FakeVikunja, bucket: number) =>
+  [...f.bucketOf].filter(([, b]) => b === bucket).map(([t]) => t)
+    .sort((a, b) => f.pos(a) - f.pos(b) || a - b);
+
+Deno.test("reorder: a 99-card bucket then a 4-card bucket converges (per-bucket budget)", async () => {
+  // The live 2026-10-20 shape: 98 moves in Backlog used up one shared
+  // budget of 100, and Waiting was blamed. 98 + 3 moves > 100.
+  const f = new FakeVikunja();
+  const backlog = reversed(f, 10, 99);
+  const waiting = reversed(f, 14, 4);
+  await withFake(f, async (run, store) => {
+    await run("reorder", { apply: true });
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, true);
+    assertStrictEquals(plan.error, null);
+    assertEquals(plan.movesByBucket, { Backlog: 98, Waiting: 3 });
+    assertStrictEquals(plan.iterations, 101);
+    assertEquals(plan.repeatedMoves, []);
+  });
+  assertEquals(order(f, 10), [...backlog].reverse());
+  assertEquals(order(f, 14), [...waiting].reverse());
+});
+
+Deno.test("reorder: non-convergence names the bucket that spent its budget, and writes the plan first", async () => {
+  const f = new FakeVikunja();
+  reversed(f, 10, 6);
+  const waiting = reversed(f, 14, 3);
+  // The card that belongs first in Waiting never takes its position.
+  f.stuckPositions.add(waiting[2]);
+  await withFake(f, async (run, store) => {
+    const err = await assertRejects(
+      () => run("reorder", { apply: true, maxIterations: 4 }),
+      Error,
+      'did not converge in bucket "Waiting" after 6 moves there (budget 6)',
+    );
+    assert(err.message.includes("Moves per bucket: Backlog 5, Waiting 6"));
+    assert(err.message.includes(`#${waiting[2]} x6`));
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, false);
+    assertEquals(plan.movesByBucket, { Backlog: 5, Waiting: 6 });
+    assertEquals(plan.repeatedMoves, [
+      { taskId: waiting[2], bucket: "Waiting", moves: 6 },
+    ]);
+    assert(String(plan.error).includes('bucket "Waiting"'));
+  });
+});
+
+Deno.test("reorder writes its plan before a recalculation give-up, too", async () => {
+  const f = new FakeVikunja();
+  outOfOrder(f, [1000, 2000, 3000]);
+  f.fail4028 = 99;
+  await withFake(f, async (run, store) => {
+    await assertRejects(() => run("reorder", { apply: true }));
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, false);
+    assertStrictEquals(plan.recalculations, 1);
+    assertStrictEquals(plan.iterations, 0);
+    assert(String(plan.error).includes("straight after a full"));
+  });
+});
+
+// ------------------------------------------------------------ truncation
+
+Deno.test("board and audit report truncated: false on a normal board", async () => {
+  const f = new FakeVikunja();
+  f.seed();
+  await withFake(f, async (run, store) => {
+    await run("board", {});
+    await run("audit", {});
+    assertStrictEquals(store.get("board-5")!.truncated, false);
+    assertStrictEquals(store.get("audit-5")!.truncated, false);
+  });
+});
+
+Deno.test("board and audit surface a board cut off at the page cap", async () => {
+  const f = new FakeVikunja();
+  f.seed();
+  f.endless = true;
+  await withFake(f, async (run, store) => {
+    await run("board", {});
+    await run("audit", {});
+    assertStrictEquals(store.get("board-5")!.truncated, true);
+    assertStrictEquals(store.get("audit-5")!.truncated, true);
+  });
+  const pages = f.reads.filter((r) =>
+    r.startsWith("/projects/5/views/20/tasks?")
+  );
+  assertStrictEquals(pages.length, 2 * 100);
+  assertStrictEquals(
+    f.logs.filter((l) => l.level === "warning" && l.msg.includes("truncated"))
+      .length,
+    2,
+  );
+});
+
+Deno.test("writes refuse to act on a truncated board or label list", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed();
+  f.endless = true;
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () =>
+        run("set_due_date", { taskId: id, dueDate: "2026-11-04T17:00:00Z" }),
+      Error,
+      "truncated board",
+    );
+    await assertRejects(
+      () => run("create_label", { title: "zz-new", humanInstructed: true }),
+      Error,
+      "truncated list",
+    );
+    assertEquals(store.size, 0);
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("vikunjaTask keeps Vikunja's unlisted fields; own resources are exact", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed({ identifier: "#7", percent_done: 0.5 });
+  await withFake(f, async (run, store) => {
+    await run("get_task", { taskId: id });
+    await run("board", {});
+    const rec = store.get(`get-${id}`)!;
+    assertStrictEquals(rec.identifier, "#7");
+    assertStrictEquals(rec.percent_done, 0.5);
+    assertEquals(Object.keys(store.get("board-5")!).sort(), [
+      "buckets",
+      "cards",
+      "fetchedAt",
+      "projectId",
+      "total",
+      "truncated",
+      "viewId",
+    ]);
+  });
+});
+
 // ------------------------------------------------------------- logging
 
 Deno.test("every method logs its start, and every message is a constant template", async () => {
@@ -1348,6 +1709,7 @@ Deno.test("every method logs its start, and every message is a constant template
     ["update_task", { taskId: a, priority: 4 }],
     ["update_task", { taskId: a, priority: 4 }], // no change
     ["set_labels", { taskId: a, add: ["automation"] }],
+    ["create_label", { title: "zz-logged", humanInstructed: true }],
     ["move_task", { taskId: a, bucketName: "Doing" }],
     ["move_task", { taskId: a, bucketName: "Doing" }], // already there
     ["set_due_date", { taskId: a, dueDate: "2026-11-04T17:00:00Z" }],

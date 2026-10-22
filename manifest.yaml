@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.10.15.1"
+version: "2026.10.22.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -31,7 +31,8 @@ description: |
     nothing unless every op is valid, then run them in order with
     read-backs, stopping at the first failure. Records a planResult.
   - **board** — Read-only: every open card (full description, bucket and
-    role, labels, priority, due date) as one boardSnapshot resource.
+    role, labels, priority, due date) as one boardSnapshot resource, with
+    truncated: true if the read hit the page cap.
   - **get_task** — Read-only: one card and the bucket it sits in.
   - **list_recent** — List the most recently created tasks in a project.
   - **audit** — Read-only Definition-of-Ready audit of the whole board:
@@ -43,14 +44,16 @@ description: |
     by default; apply moves one card at a time and re-reads until the
     board converges. A gap too small to halve, or a Vikunja 4028, makes it
     respace the view first (position below 0.01 triggers Vikunja's full
-    recalculation).
+    recalculation). Each bucket has its own move budget; a run that gives
+    up names that bucket and still writes its reorderPlan.
   - **due_report** — Read-only: split the board's dated, not-done cards into
     overdue / due today / upcoming (lookaheadDays) with a link per card and
     a ready-to-send Markdown message, so a scheduled workflow can nudge on
     a card's due date.
   - **set_due_date** — Set or clear one card's due date via a full-task
-    read-modify-write, refusing done cards and asserting on read-back that
-    the date took and the bucket did not change.
+    read-modify-write, refusing done cards, asserting on read-back that the
+    date took, and moving the card back (verified) if the write dropped it
+    out of its bucket.
   - **update_task** — Change one card's title, description and/or priority
     via a full-task read-modify-write, asserting each field on read-back and
     moving the card back if the write dropped it out of its bucket.
@@ -61,6 +64,11 @@ description: |
     Definition of Ready and waiting a due date, unless force: true.
   - **close_task** — Mark one card done and move it into the done bucket;
     runs only with humanInstructed: true.
+  - **create_label** — Create one label (title, optional hexColor and
+    description), idempotently: an existing title (case-insensitive,
+    every page read) is returned instead of a duplicate, and a new one is
+    read back. Runs only with humanInstructed: true; no other method
+    creates labels.
 
   The edit methods (update_task, set_labels, move_task, set_due_date)
   refuse done cards and cards someone else updated within

@@ -154,11 +154,22 @@ type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 // ============================================================================
 // Resource schemas
 // ============================================================================
+//
+// Unknown keys: the schemas this model builds itself (summary, boardAudit,
+// reorderPlan, dueReport, boardSnapshot, planResult, label) are plain
+// z.object, which strips: a stored resource holds exactly the documented
+// fields, and a Vikunja upgrade cannot change its shape. Only LabelRefSchema
+// and VikunjaTaskSchema pass unknown keys through, on purpose: a vikunjaTask
+// record is the task exactly as Vikunja read it back (index, identifier,
+// percent_done, position, ...), and readers of task-<id> / get-<id> use
+// fields this schema does not list. Stripping them would silently drop data
+// those readers depend on.
 
 const LabelRefSchema = z.object({
   id: z.number(),
   title: z.string(),
   hex_color: z.string().nullable().optional(),
+  // passthrough on purpose: see the note above the resource schemas.
 }).passthrough();
 
 const VikunjaTaskSchema = z.object({
@@ -209,6 +220,7 @@ const VikunjaTaskSchema = z.object({
   collectedBy: z.string().optional().describe(
     "Extension that collected this data.",
   ),
+  // passthrough on purpose: the record is the task as Vikunja returned it.
 }).passthrough();
 
 const SummarySchema = z.object({
@@ -219,7 +231,7 @@ const SummarySchema = z.object({
   total: z.number().describe("Number of items written by this run."),
   ids: z.array(z.number()).default([]),
   fetchedAt: z.string(),
-}).passthrough();
+});
 
 const FindingSchema = z.object({
   taskId: z.number().nullable().describe(
@@ -263,7 +275,11 @@ const BoardAuditSchema = z.object({
     "Definition-of-Ready roll-up for the ready column: a card passes when " +
       "it has no error-level findings.",
   ),
-}).passthrough();
+  truncated: z.boolean().default(false).describe(
+    "True when the board read stopped at the page cap with pages still " +
+      "growing: the audit covers only part of the board.",
+  ),
+});
 
 const ReorderPlanSchema = z.object({
   projectId: z.number(),
@@ -274,7 +290,22 @@ const ReorderPlanSchema = z.object({
     "True when the final re-read of every bucket matched the intended " +
       "order (always false on a dry run that still has pending moves).",
   ),
-  iterations: z.number(),
+  iterations: z.number().describe("Single-card moves made, all buckets."),
+  movesByBucket: z.record(z.string(), z.number()).default({}).describe(
+    "Moves made per bucket title; each bucket has its own budget.",
+  ),
+  repeatedMoves: z.array(z.object({
+    taskId: z.number(),
+    bucket: z.string(),
+    moves: z.number(),
+  })).default([]).describe(
+    "Cards moved more than once in this run: a card that keeps moving is " +
+      "the sign of a move that does not stick.",
+  ),
+  error: z.string().nullable().default(null).describe(
+    "Why an apply run stopped, or null. The plan is written before the " +
+      "method throws, so a failed run still leaves its evidence.",
+  ),
   recalculations: z.number().default(0).describe(
     "Full position recalculations the run triggered (a cramped gap or a " +
       "Vikunja 4028); 0 on a dry run.",
@@ -286,7 +317,23 @@ const ReorderPlanSchema = z.object({
     from: z.number().describe("0-based index before."),
     to: z.number().describe("0-based index after."),
   })),
-}).passthrough();
+});
+
+const LabelSchema = z.object({
+  id: z.number().describe("Vikunja label id."),
+  title: z.string().describe("Label title as stored."),
+  hexColor: z.string().nullable().describe(
+    "Colour as Vikunja stores it (six hex digits, no #), or null.",
+  ),
+  description: z.string().nullable(),
+  status: z.enum(["created", "exists"]).describe(
+    "created: this run made the label. exists: a label with this title " +
+      "(case-insensitive) was already there, and nothing was written.",
+  ),
+  fetchedAt: z.string(),
+});
+/** The `label` resource written by create_label. */
+export type LabelRecord = z.infer<typeof LabelSchema>;
 
 const DueItemSchema = z.object({
   id: z.number(),
@@ -324,7 +371,7 @@ const DueReportSchema = z.object({
     "Ready-to-send Markdown body listing every section that is non-empty.",
   ),
   boardUrl: z.string(),
-}).passthrough();
+});
 /** The `dueReport` resource written by due_report. */
 export type DueReport = z.infer<typeof DueReportSchema>;
 
@@ -357,7 +404,11 @@ const BoardSnapshotSchema = z.object({
       "bucket in view order.",
   ),
   total: z.number(),
-}).passthrough();
+  truncated: z.boolean().default(false).describe(
+    "True when the board read stopped at the page cap with pages still " +
+      "growing: some cards are missing from `cards`.",
+  ),
+});
 /** The `boardSnapshot` resource written by board. */
 export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
 
@@ -404,7 +455,7 @@ const PlanResultSchema = z.object({
     problem: z.string(),
   })).describe("Every validation problem, in op order."),
   ops: z.array(PlanOpResultSchema),
-}).passthrough();
+});
 /** The `planResult` resource written by apply_plan. */
 export type PlanResult = z.infer<typeof PlanResultSchema>;
 
@@ -414,8 +465,8 @@ export type PlanResult = z.infer<typeof PlanResultSchema>;
 
 const LabelName = z.string().min(1).describe(
   "Label title to attach to the task (case-insensitive), resolved via " +
-    "GET /labels. Must already exist on the Vikunja instance — this model " +
-    "never creates labels.",
+    "GET /labels. Must already exist on the Vikunja instance: only " +
+    "create_label creates labels, never as a side effect of another write.",
 );
 
 const ProjectIdOverride = z.number().int().positive().optional().describe(
@@ -588,6 +639,23 @@ const CloseTaskArgsSchema = z.object({
   projectId: BoardProject,
 });
 
+const CreateLabelArgsSchema = z.object({
+  title: z.string().trim().min(1, "title must not be empty").describe(
+    "Label title. An existing label with this title (case-insensitive) is " +
+      "returned instead of creating a duplicate.",
+  ),
+  hexColor: z.string().trim().regex(
+    /^#?[0-9a-fA-F]{6}$/,
+    "hexColor must be six hex digits, with or without a leading #",
+  ).optional().describe("Optional colour, e.g. 1973ff or #1973ff."),
+  description: z.string().optional().describe("Optional label description."),
+  humanInstructed: z.boolean().default(false).describe(
+    "Must be true. Labels are the board's shared vocabulary, so a caller " +
+      "has to state that a person asked for this one; unattended runs (the " +
+      "groomer) never create labels.",
+  ),
+});
+
 const ReorderArgsSchema = z.object({
   projectId: ProjectIdOverride,
   apply: z.boolean().default(false).describe(
@@ -603,7 +671,9 @@ const ReorderArgsSchema = z.object({
       "except the done role.",
   ),
   maxIterations: z.number().int().min(1).max(500).default(100).describe(
-    "Upper bound on single-card moves before reorder gives up.",
+    "Move budget PER BUCKET: reorder gives up on a bucket after " +
+      "max(maxIterations, 2 x its card count) single-card moves in it. One " +
+      "long bucket no longer spends the budget of the buckets after it.",
   ),
 });
 type ReorderArgs = z.infer<typeof ReorderArgsSchema>;
@@ -843,23 +913,27 @@ async function serverPageSize(g: GlobalArgs): Promise<number | null> {
     : null;
 }
 
+/** Most pages any paged read fetches before it reports `truncated`. */
+export const MAX_PAGES = 100;
+
 /**
  * GET every page of a paginated list endpoint, de-duplicated by numeric id.
  * Vikunja clamps `per_page` to `max_items_per_page` (50 by default), so one
  * request silently truncates any longer list. Stops on a page that adds no
  * new id (an empty page, or a server that ignores `page`), on a short page
- * when the page size is known from /info, or after 100 pages.
+ * when the page size is known from /info, or after MAX_PAGES pages, in
+ * which case `truncated` is true and the list is incomplete.
  */
 async function fetchAllPages(
   g: GlobalArgs,
   path: string,
   search: Record<string, string> = {},
-): Promise<Array<Record<string, unknown>>> {
+): Promise<{ items: Array<Record<string, unknown>>; truncated: boolean }> {
   const known = await serverPageSize(g);
   const perPage = known ?? 50;
   const out: Array<Record<string, unknown>> = [];
   const seen = new Set<number>();
-  for (let page = 1; page <= 100; page++) {
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const raw = asArray(
       await vreq(g, "GET", path, {
         search: { ...search, page: String(page), per_page: String(perPage) },
@@ -874,15 +948,28 @@ async function fetchAllPages(
     }
     // A short page ends the list only when the page size is trusted: with
     // the fallback, a server capped below 50 would look short on page 1.
-    if (!grew || (known !== null && raw.length < perPage)) break;
+    if (!grew || (known !== null && raw.length < perPage)) {
+      return { items: out, truncated: false };
+    }
   }
-  return out;
+  return { items: out, truncated: true };
 }
 
-/** Every label visible to the token, keyed by lower-cased title. */
+/**
+ * Every label visible to the token, keyed by lower-cased title. Throws when
+ * the list is truncated: resolving (or, in create_label, de-duplicating)
+ * against part of the labels would be wrong without saying so.
+ */
 async function fetchAllLabels(g: GlobalArgs): Promise<Map<string, LabelRef>> {
   const known = new Map<string, LabelRef>();
-  for (const l of await fetchAllPages(g, "/labels")) {
+  const { items, truncated } = await fetchAllPages(g, "/labels");
+  if (truncated) {
+    throw new Error(
+      `GET /labels still had more after ${MAX_PAGES} pages; refusing to ` +
+        "resolve or create labels against a truncated list.",
+    );
+  }
+  for (const l of items) {
     if (typeof l.id === "number" && typeof l.title === "string") {
       known.set(l.title.toLowerCase(), { id: l.id, title: l.title });
     }
@@ -894,7 +981,7 @@ async function fetchAllLabels(g: GlobalArgs): Promise<Map<string, LabelRef>> {
  * Resolve label titles (case-insensitive) to their ids against `known`
  * (from fetchAllLabels, which reads every page of GET /labels),
  * de-duplicated. Throws naming every unknown title and listing the known
- * ones. This model never creates labels.
+ * ones. Only create_label creates labels; no other write does it implicitly.
  */
 function resolveLabels(
   known: Map<string, LabelRef>,
@@ -910,7 +997,7 @@ function resolveLabels(
   if (unknown.length) {
     throw new Error(
       `Label(s) not found on this Vikunja instance: ${unknown.join(", ")} ` +
-        `(labels are never created here); known: ` +
+        `(create them with create_label first); known: ` +
         [...known.values()].map((l) => l.title).sort().join(", "),
     );
   }
@@ -1261,11 +1348,18 @@ async function findOpenTitle(
       open.push(...b.tasks.filter((t) => !t.done));
     }
   } else {
-    for (
-      const t of await fetchAllPages(g, `/projects/${projectId}/tasks`, {
-        s: title.trim(),
-      })
-    ) {
+    const { items, truncated } = await fetchAllPages(
+      g,
+      `/projects/${projectId}/tasks`,
+      { s: title.trim() },
+    );
+    if (truncated) {
+      throw new Error(
+        `The title search for a duplicate still had more after ${MAX_PAGES} ` +
+          "pages; refusing to decide the title is new.",
+      );
+    }
+    for (const t of items) {
       if (
         typeof t.id === "number" && typeof t.title === "string" &&
         t.done !== true
@@ -1444,12 +1538,14 @@ export function dueDateOf(raw: unknown): string | null {
  * endpoint paginates *per bucket* (page size from /info), so a single page
  * silently truncates any bucket longer than that limit. Keep fetching pages
  * until no bucket gains a task; tasks are ordered by their view position.
+ * `truncated` is true when MAX_PAGES pages were read and the last one still
+ * added cards.
  */
-async function fetchBoard(
+async function readBoard(
   g: GlobalArgs,
   projectId: number,
   viewId: number,
-): Promise<BoardBucket[]> {
+): Promise<{ buckets: BoardBucket[]; truncated: boolean }> {
   const info = await vreq(g, "GET", "/info").catch(() => null) as
     | Record<string, unknown>
     | null;
@@ -1458,7 +1554,8 @@ async function fetchBoard(
     : 50;
 
   const buckets = new Map<number, BoardBucket>();
-  for (let page = 1; page <= 100; page++) {
+  let truncated = true;
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const raw = asArray(
       await vreq(g, "GET", `/projects/${projectId}/views/${viewId}/tasks`, {
         search: { page: String(page), per_page: String(perPage) },
@@ -1484,11 +1581,35 @@ async function fetchBoard(
       }
       buckets.set(b.id, bucket);
     }
-    if (!grew) break;
+    if (!grew) {
+      truncated = false;
+      break;
+    }
   }
   const out = [...buckets.values()].sort((a, b) => a.position - b.position);
   for (const b of out) b.tasks.sort((a, c) => a.position - c.position);
-  return out;
+  return { buckets: out, truncated };
+}
+
+/**
+ * readBoard for everything that acts on the board (writes, reorder, due
+ * report, duplicate checks): a truncated read throws, because a card that
+ * was not read looks like a card that is not there. board and audit call
+ * readBoard and report `truncated` instead.
+ */
+async function fetchBoard(
+  g: GlobalArgs,
+  projectId: number,
+  viewId: number,
+): Promise<BoardBucket[]> {
+  const { buckets, truncated } = await readBoard(g, projectId, viewId);
+  if (truncated) {
+    throw new Error(
+      `Project ${projectId} view ${viewId} still had more cards after ` +
+        `${MAX_PAGES} pages; refusing to act on a truncated board.`,
+    );
+  }
+  return buckets;
 }
 
 /**
@@ -1897,6 +2018,20 @@ export function nextMove(
   return null;
 }
 
+/** How many entries per bucket, in first-seen order. */
+function countBy(
+  made: Array<{ bucket: string }>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const m of made) out[m.bucket] = (out[m.bucket] ?? 0) + 1;
+  return out;
+}
+
+function formatCounts(counts: Record<string, number>): string {
+  const parts = Object.entries(counts).map(([k, n]) => `${k} ${n}`);
+  return parts.length ? parts.join(", ") : "none";
+}
+
 /** Whether an error is Vikunja's 4028 "needs full view recalculation". */
 function isNeedsRecalculation(err: unknown): boolean {
   return err instanceof Error && /"code":\s*4028\b/.test(err.message);
@@ -1919,6 +2054,14 @@ async function recalculatePositions(
   });
 }
 
+function warnTruncated(ctx: ExecCtx, method: string, projectId: number) {
+  ctx.logger?.warning(
+    "{method}: board read stopped at the page cap with cards still coming; " +
+      "the result is truncated",
+    { method, projectId, maxPages: MAX_PAGES },
+  );
+}
+
 async function requireKanbanView(
   g: GlobalArgs,
   projectId: number,
@@ -1938,10 +2081,11 @@ async function audit(
   const now = new Date();
   const projectId = args.projectId ?? g.projectId;
   const viewId = await requireKanbanView(g, projectId);
-  const board = await fetchBoard(g, projectId, viewId);
+  const { buckets: board, truncated } = await readBoard(g, projectId, viewId);
   if (board.length === 0) {
     throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
   }
+  if (truncated) warnTruncated(ctx, "audit", projectId);
 
   const findings: Finding[] = [];
   const buckets: z.infer<typeof BoardAuditSchema>["buckets"] = [];
@@ -1983,6 +2127,7 @@ async function audit(
     findings,
     counts: { findings: findings.length, bySeverity, byRule },
     ready,
+    truncated,
   });
   const handle = await ctx.writeResource(
     "boardAudit",
@@ -2204,15 +2349,17 @@ async function boardMethod(
   const fetchedAt = new Date().toISOString();
   const projectId = args.projectId ?? g.projectId;
   const viewId = await requireKanbanView(g, projectId);
-  const board = await fetchBoard(g, projectId, viewId);
+  const { buckets: board, truncated } = await readBoard(g, projectId, viewId);
   if (board.length === 0) {
     throw new Error(`Project ${projectId} view ${viewId} returned no buckets.`);
   }
+  if (truncated) warnTruncated(ctx, "board", projectId);
   const snapshot = BoardSnapshotSchema.parse({
     projectId,
     viewId,
     fetchedAt,
     ...snapshotBoard(board, g.bucketRoles),
+    truncated,
   });
   const handle = await ctx.writeResource(
     "boardSnapshot",
@@ -2296,25 +2443,21 @@ async function setDueDate(
     throw new Error(`dueDate is not a parseable instant: ${args.dueDate}`);
   }
 
+  // Pre-flight, in order: the card is on the view, the done/recent-edit
+  // guard, and the waiting-card rule. Nothing is written before all pass.
   const viewId = await requireKanbanView(g, projectId);
-  const bucketBefore = await bucketTitleOf(g, projectId, viewId, args.taskId);
-  if (bucketBefore === null) {
-    throw new Error(
-      `Task ${args.taskId} is not on project ${projectId}'s kanban view.`,
-    );
-  }
-
+  const bucketBefore = await requireBucketOf(g, projectId, viewId, args.taskId);
   const full = await readTask(g, args.taskId);
   await guardWrite(g, ctx, full, args.force);
-  if (
-    wanted === null && !args.force &&
-    roleOf(bucketBefore, g.bucketRoles) === "waiting"
-  ) {
-    throw new Error(
-      `Refusing to clear task ${args.taskId}'s due date while it is in ` +
-        `"${bucketBefore}": a waiting card needs one. Move it first, or ` +
-        `pass force: true.`,
-    );
+  const clearing = clearWaitingDueProblem(
+    args.taskId,
+    bucketBefore,
+    wanted,
+    args.force,
+    g.bucketRoles,
+  );
+  if (clearing !== null) {
+    throw new Error(`${clearing}. Move it first, or pass force: true.`);
   }
   const before = dueDateOf(full.due_date);
   if (
@@ -2345,25 +2488,29 @@ async function setDueDate(
       `Task ${args.taskId}: due date read back as ${got}, wanted ${wanted}.`,
     );
   }
-  const bucketAfter = await bucketTitleOf(g, projectId, viewId, args.taskId);
-  if (bucketAfter !== bucketBefore) {
-    throw new Error(
-      `Task ${args.taskId}: due date is set but the card moved from bucket ` +
-        `"${bucketBefore}" to "${bucketAfter}" — a full-replace write ` +
-        `un-bucketed it; move it back by hand.`,
-    );
-  }
+  await restoreBucket(
+    g,
+    ctx,
+    projectId,
+    viewId,
+    args.taskId,
+    bucketBefore,
+    "the due date is set",
+  );
 
+  // Re-read: a move back changes `updated`, and task-<id> must hold the
+  // latest one for the recent-edit guard to recognise our own write.
+  const final = await readTask(g, args.taskId);
   const handle = await ctx.writeResource(
     "vikunjaTask",
     `task-${args.taskId}`,
-    toVikunjaTask(after, fetchedAt),
+    toVikunjaTask(final, fetchedAt),
   );
   ctx.logger?.info("Task {taskId}: due date {before} -> {after}", {
     taskId: args.taskId,
     before,
     after: got,
-    bucket: bucketAfter,
+    bucket: bucketBefore,
   });
   return { dataHandles: [handle] };
 }
@@ -2405,6 +2552,58 @@ async function guardProblem(
   return `Task ${id} was updated ${task.updated} (less than ${minutes} min ago) ` +
     `by something other than this model; someone may be editing it. ` +
     `Pass force: true to write anyway.`;
+}
+
+/**
+ * Pre-flight rule shared by set_due_date and apply_plan's due op: a card in
+ * the waiting bucket must keep a due date, so clearing it is refused unless
+ * forced. Returns the refusal, or null.
+ */
+function clearWaitingDueProblem(
+  taskId: number,
+  bucket: string,
+  wanted: string | null,
+  force: boolean,
+  roles: Roles,
+): string | null {
+  if (wanted !== null || force || roleOf(bucket, roles) !== "waiting") {
+    return null;
+  }
+  return `refusing to clear the due date of task ${taskId} while it is in ` +
+    `"${bucket}": a waiting card needs one`;
+}
+
+/**
+ * After a full-replace POST /tasks/{id}: Vikunja can drop the card out of
+ * its bucket. If it is no longer in `bucketBefore`, move it back and verify
+ * that landed. Throws only when the move back did not stick, so a write that
+ * un-buckets a card never leaves it out of its column silently.
+ */
+async function restoreBucket(
+  g: GlobalArgs,
+  ctx: ExecCtx,
+  projectId: number,
+  viewId: number,
+  taskId: number,
+  bucketBefore: string,
+  what: string,
+): Promise<void> {
+  const bucketAfter = await bucketTitleOf(g, projectId, viewId, taskId);
+  if (bucketAfter === bucketBefore) return;
+  const back = await resolveBucket(g, projectId, viewId, bucketBefore);
+  await moveTaskToBucket(g, projectId, viewId, back.id, taskId);
+  const restored = await bucketTitleOf(g, projectId, viewId, taskId);
+  if (restored !== bucketBefore) {
+    throw new Error(
+      `Task ${taskId}: ${what}, but the write moved the card from ` +
+        `"${bucketBefore}" to "${bucketAfter}" and moving it back left it ` +
+        `in "${restored}".`,
+    );
+  }
+  ctx.logger?.warning(
+    "Task {taskId}: the write moved the card out of {bucket}; moved it back",
+    { taskId, bucket: bucketBefore, movedTo: bucketAfter },
+  );
 }
 
 /** Where a card sits now; throws when it is not on the view at all. */
@@ -2467,23 +2666,15 @@ async function updateTask(
       `Task ${args.taskId}: ${wrong.join(", ")} did not read back as sent.`,
     );
   }
-  const bucketAfter = await bucketTitleOf(g, projectId, viewId, args.taskId);
-  if (bucketAfter !== bucketBefore) {
-    const back = await resolveBucket(g, projectId, viewId, bucketBefore);
-    await moveTaskToBucket(g, projectId, viewId, back.id, args.taskId);
-    const restored = await bucketTitleOf(g, projectId, viewId, args.taskId);
-    if (restored !== bucketBefore) {
-      throw new Error(
-        `Task ${args.taskId}: fields are set, but the write moved the card ` +
-          `from "${bucketBefore}" to "${bucketAfter}" and moving it back ` +
-          `left it in "${restored}".`,
-      );
-    }
-    ctx.logger?.warning(
-      "Task {taskId}: the write moved the card out of {bucket}; moved it back",
-      { taskId: args.taskId, bucket: bucketBefore, movedTo: bucketAfter },
-    );
-  }
+  await restoreBucket(
+    g,
+    ctx,
+    projectId,
+    viewId,
+    args.taskId,
+    bucketBefore,
+    "fields are set",
+  );
 
   const final = await readTask(g, args.taskId);
   const handle = await ctx.writeResource(
@@ -2704,6 +2895,98 @@ async function closeTask(
   return { dataHandles: [handle] };
 }
 
+/**
+ * Create one label, idempotently: every page of GET /labels is read first,
+ * and a label whose title matches (case-insensitive) is returned as
+ * `exists` instead of being duplicated. A new label is read back by id and
+ * its title (and colour, when given) asserted. Only runs with
+ * humanInstructed: true.
+ */
+async function createLabel(
+  args: z.infer<typeof CreateLabelArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  if (!args.humanInstructed) {
+    throw new Error(
+      "create_label is never automatic: pass humanInstructed: true when a " +
+        "person asked for this label.",
+    );
+  }
+  const title = args.title;
+  const hexColor = args.hexColor?.replace(/^#/, "").toLowerCase();
+
+  const known = await fetchAllLabels(g);
+  const hit = known.get(title.toLowerCase());
+  let raw: Record<string, unknown>;
+  let status: LabelRecord["status"];
+  if (hit) {
+    raw = await vreq(g, "GET", `/labels/${hit.id}`) as Record<string, unknown>;
+    status = "exists";
+  } else {
+    const made = await vreq(g, "PUT", "/labels", {
+      body: {
+        title,
+        ...(hexColor !== undefined ? { hex_color: hexColor } : {}),
+        ...(args.description !== undefined
+          ? { description: args.description }
+          : {}),
+      },
+    }) as Record<string, unknown> | null;
+    if (!made || typeof made.id !== "number") {
+      throw new Error(
+        `Vikunja PUT /labels returned no label id for "${title}"; check ` +
+          "GET /labels before retrying.",
+      );
+    }
+    raw = await vreq(g, "GET", `/labels/${made.id}`) as Record<
+      string,
+      unknown
+    >;
+    const wrong: string[] = [];
+    if (raw.title !== title) wrong.push(`title ${JSON.stringify(raw.title)}`);
+    if (
+      hexColor !== undefined &&
+      String(raw.hex_color ?? "").replace(/^#/, "").toLowerCase() !== hexColor
+    ) wrong.push(`hex_color ${JSON.stringify(raw.hex_color)}`);
+    if (
+      args.description !== undefined && raw.description !== args.description
+    ) wrong.push("description");
+    if (wrong.length) {
+      throw new Error(
+        `Label ${made.id} was created but read back with ${wrong.join(", ")}.`,
+      );
+    }
+    status = "created";
+  }
+
+  const record = LabelSchema.parse({
+    id: raw.id,
+    title: raw.title,
+    hexColor: typeof raw.hex_color === "string" && raw.hex_color !== ""
+      ? raw.hex_color
+      : null,
+    description: typeof raw.description === "string" ? raw.description : null,
+    status,
+    fetchedAt,
+  });
+  const handle = await ctx.writeResource("label", `label-${record.id}`, record);
+  if (status === "exists") {
+    ctx.logger?.info("Label {labelId} {title} already exists; not created", {
+      labelId: record.id,
+      title: record.title,
+      requested: title,
+    });
+  } else {
+    ctx.logger?.info("Created label {labelId} {title}", {
+      labelId: record.id,
+      title: record.title,
+    });
+  }
+  return { dataHandles: [handle] };
+}
+
 async function reorder(
   args: ReorderArgs,
   ctx: ExecCtx,
@@ -2749,80 +3032,125 @@ async function reorder(
   let iterations = 0;
   let recalculations = 0;
   let converged = moves.length === 0;
+  let error: string | null = null;
+  // Every move made, in order, for the per-bucket counts and the repeats.
+  const made: Array<{ taskId: number; bucket: string }> = [];
+  const movesIn = (bucket: string) =>
+    made.filter((m) => m.bucket === bucket).length;
+  const repeatedMoves = () => {
+    const counts = new Map<
+      string,
+      { taskId: number; bucket: string; moves: number }
+    >();
+    for (const m of made) {
+      const k = `${m.bucket}\u0000${m.taskId}`;
+      const c = counts.get(k) ?? { ...m, moves: 0 };
+      c.moves++;
+      counts.set(k, c);
+    }
+    return [...counts.values()].filter((c) => c.moves > 1)
+      .sort((a, b) => b.moves - a.moves || a.taskId - b.taskId);
+  };
   if (args.apply && moves.length > 0) {
-    // True between a recalculation and the next successful move: a second
-    // cramped gap or 4028 in that window means respacing did not help.
-    let justRecalculated = false;
-    const recalculate = async (b: BoardBucket, reason: string) => {
-      if (justRecalculated) {
-        throw new Error(
-          `reorder: ${reason} in bucket "${b.title}" straight after a full ` +
-            "position recalculation; giving up.",
-        );
-      }
-      const first = orderOf(b)[0];
-      await recalculatePositions(g, viewId, first.id);
-      recalculations++;
-      justRecalculated = true;
-      ctx.logger?.info(
-        "Recalculated view {viewId} positions ({reason}, via #{taskId})",
-        { viewId, reason, taskId: first.id, bucket: b.title },
-      );
-      board = await fetchBoard(g, projectId, viewId);
-    };
-    for (
-      const bucketTitle of board.filter((b) => inScope(b.title)).map((b) =>
-        b.title
-      )
-    ) {
-      for (;;) {
-        const b = board.find((x) => x.title === bucketTitle);
-        if (!b) {
-          throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
-        }
-        const move = nextMove(b.tasks, orderOf(b));
-        if (!move) break;
-        if (move.cramped) {
-          await recalculate(b, "gap below minimum spacing");
-          continue;
-        }
-        if (iterations >= args.maxIterations) {
+    try {
+      // True between a recalculation and the next successful move: a second
+      // cramped gap or 4028 in that window means respacing did not help.
+      let justRecalculated = false;
+      const recalculate = async (b: BoardBucket, reason: string) => {
+        if (justRecalculated) {
           throw new Error(
-            `reorder did not converge after ${iterations} moves (bucket "${bucketTitle}" still out of order).`,
+            `reorder: ${reason} in bucket "${b.title}" straight after a ` +
+              "full position recalculation; giving up.",
           );
         }
-        iterations++;
-        try {
-          await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
-            body: {
-              project_view_id: viewId,
-              task_id: move.task.id,
-              position: move.position,
-            },
-          });
-        } catch (err) {
-          if (!isNeedsRecalculation(err)) throw err;
-          await recalculate(b, "Vikunja 4028");
-          continue;
-        }
-        justRecalculated = false;
-        ctx.logger?.info("Moved #{taskId} to slot {slot} in {bucket}", {
-          taskId: move.task.id,
-          slot: move.index,
-          bucket: bucketTitle,
-          position: move.position,
-        });
-        // Vikunja may not store the exact number sent — always re-read.
+        const first = orderOf(b)[0];
+        await recalculatePositions(g, viewId, first.id);
+        recalculations++;
+        justRecalculated = true;
+        ctx.logger?.info(
+          "Recalculated view {viewId} positions ({reason}, via #{taskId})",
+          { viewId, reason, taskId: first.id, bucket: b.title },
+        );
         board = await fetchBoard(g, projectId, viewId);
+      };
+      for (
+        const bucketTitle of board.filter((b) => inScope(b.title)).map((b) =>
+          b.title
+        )
+      ) {
+        // Each bucket gets its own budget, scaled to its size: a sort of n
+        // cards needs at most n - 1 moves when every move sticks.
+        const start = board.find((x) => x.title === bucketTitle);
+        const budget = Math.max(
+          args.maxIterations,
+          2 * (start?.tasks.length ?? 0),
+        );
+        for (;;) {
+          const b = board.find((x) => x.title === bucketTitle);
+          if (!b) {
+            throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
+          }
+          const move = nextMove(b.tasks, orderOf(b));
+          if (!move) break;
+          if (move.cramped) {
+            await recalculate(b, "gap below minimum spacing");
+            continue;
+          }
+          if (movesIn(bucketTitle) >= budget) {
+            const repeats = repeatedMoves().filter((r) =>
+              r.bucket === bucketTitle
+            );
+            throw new Error(
+              `reorder did not converge in bucket "${bucketTitle}" after ` +
+                `${movesIn(bucketTitle)} moves there (budget ${budget}). ` +
+                `Moves per bucket: ${formatCounts(countBy(made))}. ` +
+                (repeats.length
+                  ? `Cards moved more than once in "${bucketTitle}": ` +
+                    repeats.slice(0, 10).map((r) => `#${r.taskId} x${r.moves}`)
+                      .join(", ") +
+                    "."
+                  : `No card in "${bucketTitle}" moved twice.`),
+            );
+          }
+          iterations++;
+          try {
+            await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
+              body: {
+                project_view_id: viewId,
+                task_id: move.task.id,
+                position: move.position,
+              },
+            });
+          } catch (err) {
+            iterations--;
+            if (!isNeedsRecalculation(err)) throw err;
+            await recalculate(b, "Vikunja 4028");
+            continue;
+          }
+          made.push({ taskId: move.task.id, bucket: bucketTitle });
+          justRecalculated = false;
+          ctx.logger?.info("Moved #{taskId} to slot {slot} in {bucket}", {
+            taskId: move.task.id,
+            slot: move.index,
+            bucket: bucketTitle,
+            position: move.position,
+          });
+          // Vikunja may not store the exact number sent — always re-read.
+          board = await fetchBoard(g, projectId, viewId);
+        }
       }
-    }
-    converged = board.filter((b) => inScope(b.title)).every((b) =>
-      sameOrder(b.tasks, orderOf(b))
-    );
-    if (!converged) {
-      throw new Error(
-        "reorder finished its moves but a final re-read is still out of order.",
+      converged = board.filter((b) => inScope(b.title)).every((b) =>
+        sameOrder(b.tasks, orderOf(b))
       );
+      if (!converged) {
+        throw new Error(
+          "reorder finished its moves but a final re-read is still out of " +
+            "order.",
+        );
+      }
+    } catch (err) {
+      converged = false;
+      error = err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -2833,14 +3161,20 @@ async function reorder(
     applied: args.apply,
     converged,
     iterations,
+    movesByBucket: countBy(made),
+    repeatedMoves: repeatedMoves(),
+    error,
     recalculations,
     moves,
   });
+  // Written before any throw: a run that gave up still leaves the moves it
+  // made, per bucket, for triage.
   const handle = await ctx.writeResource(
     "reorderPlan",
     `reorder-${projectId}`,
     plan,
   );
+  if (error !== null) throw new Error(error);
   if (args.apply) {
     ctx.logger?.info(
       "Reordered project {projectId}: {moves} moves, {recalculations} " +
@@ -3116,15 +3450,14 @@ async function validatePlan(
       if (due !== null && !Number.isFinite(Date.parse(due))) {
         problems.push(`dueDate is not a parseable instant: ${op.dueDate}`);
       }
-      if (
-        due === null && !op.force &&
-        roleOf(card.bucket, g.bucketRoles) === "waiting"
-      ) {
-        problems.push(
-          `refusing to clear the due date of task ${card.id} while it is in ` +
-            `"${card.bucket}": a waiting card needs one`,
-        );
-      }
+      const clearing = clearWaitingDueProblem(
+        card.id,
+        card.bucket,
+        due,
+        op.force,
+        g.bucketRoles,
+      );
+      if (clearing !== null) problems.push(clearing);
       card.dueDate = due;
     }
   }
@@ -3420,7 +3753,7 @@ function logged<A>(
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.10.15.1",
+  version: "2026.10.22.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3565,6 +3898,24 @@ export const model = {
         "(default 0). Existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.10.22.1",
+      description:
+        "Added create_label (title, optional hexColor/description; " +
+        "idempotent on a case-insensitive title across every label page; " +
+        "read back; humanInstructed: true required) and the label resource. " +
+        "No other method creates labels. reorder's maxIterations is now a " +
+        "per-bucket budget (max(maxIterations, 2 x cards)); a give-up names " +
+        "the bucket, moves per bucket and repeated cards, and the " +
+        "reorderPlan (new movesByBucket, repeatedMoves, error) is written " +
+        "before the throw. set_due_date moves a card back (verified) when " +
+        "the write drops its bucket, instead of failing. board and audit " +
+        "carry truncated; writes refuse a truncated board or label read. " +
+        "This model's own resource schemas strip unknown keys (vikunjaTask " +
+        "still keeps Vikunja's fields). Global arguments are unchanged, so " +
+        "existing model attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     vikunjaTask: {
@@ -3595,6 +3946,13 @@ export const model = {
       schema: ReorderPlanSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
+    },
+    label: {
+      description: "One create_label run: the label's id, title, colour and " +
+        "description, and whether it was created or already existed.",
+      schema: LabelSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
     },
     dueReport: {
       description:
@@ -3658,7 +4016,8 @@ export const model = {
         "Set or clear one card's due date — the day to look at it again. " +
         "Reads the full task, writes it back with only due_date changed " +
         "(Vikunja's POST /tasks/{id} is a full replace), re-reads and " +
-        "asserts the date took and the card is still in the same bucket. " +
+        "asserts the date took, and moves the card back (verified) if the " +
+        "write dropped it out of its bucket. " +
         "Refuses done cards, cards someone else updated within " +
         "policy.recentEditMinutes, and clearing the date of a waiting card, " +
         "unless force: true. Records the task as a vikunjaTask resource.",
@@ -3727,6 +4086,18 @@ export const model = {
       arguments: CloseTaskArgsSchema,
       execute: logged("close_task", closeTask),
     },
+    create_label: {
+      description:
+        "Create one label (title, optional hexColor and description). " +
+        "Idempotent: every page of labels is read first, and an existing " +
+        "label with the same title (case-insensitive) is returned with " +
+        "status exists instead of a duplicate. A new label is read back by " +
+        "id. Only runs with humanInstructed: true; no other method creates " +
+        "labels (apply_plan, new_task and set_labels still refuse unknown " +
+        "ones). Writes a label resource named label-<id>.",
+      arguments: CreateLabelArgsSchema,
+      execute: logged("create_label", createLabel),
+    },
     apply_plan: {
       description:
         "Batch card writes in one run. Validates EVERY op (create, update, " +
@@ -3747,7 +4118,9 @@ export const model = {
         "Read-only: write every not-done card on the project's kanban " +
         "board (id, title, full description, bucket and its role, labels, " +
         "priority, due date, updated) as one boardSnapshot resource, read " +
-        "page by page so no bucket is truncated.",
+        "page by page so no bucket is truncated; `truncated` is true (and " +
+        "a warning logged) if the page cap was reached with cards still " +
+        "coming.",
       arguments: BoardArgsSchema,
       execute: logged("board", boardMethod),
     },

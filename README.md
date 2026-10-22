@@ -133,7 +133,7 @@ swamp model method run homelab-backlog reorder --arg apply=true   # do it
 swamp model method run homelab-backlog reorder --arg apply=true --arg 'buckets=["Backlog"]'
 ```
 
-With `apply=true` it moves **one card at a time** — read the bucket, move the first card that is out of place to the midpoint of its intended neighbours (`POST /tasks/{id}/position`), re-read, repeat — and fails if the board has not converged within `maxIterations`. It works this way because Vikunja re-derives positions on write, so a batch of absolute positions drifts (measured: 2 of 39 cards landed in the wrong slot with HTTP 200 on every call). A run that converges ends with a re-read that matches the intended order; a second dry run then reports 0 moves.
+With `apply=true` it moves **one card at a time** — read the bucket, move the first card that is out of place to the midpoint of its intended neighbours (`POST /tasks/{id}/position`), re-read, repeat — and fails if a bucket has not converged within its own move budget: `max(maxIterations, 2 × the bucket's card count)` moves in that bucket (default `maxIterations` 100). A long bucket does not spend the budget of the buckets after it. A run that gives up names the bucket that ran out, the moves made per bucket, and any card moved more than once there (a move that does not stick), and it writes the `reorderPlan` resource **before** it throws, with `converged: false` and the `error`, so the evidence survives. It works this way because Vikunja re-derives positions on write, so a batch of absolute positions drifts (measured: 2 of 39 cards landed in the wrong slot with HTTP 200 on every call). A run that converges ends with a re-read that matches the intended order; a second dry run then reports 0 moves.
 
 Repeated halving eventually leaves no room between two cards. Vikunja v2.6 refuses a position that collides with another card when there is less than its minimum spacing (0.01) to spread them, with HTTP 500 code **4028** ("Position repair requires full view recalculation"), and it has no endpoint for that recalculation. It does run one whenever a position below 0.01 is written. So before a move into a gap narrower than that, and after any 4028, `reorder` writes position 0 for the card that belongs first in the bucket. Vikunja then respaces the whole view, keeping every card's relative order, and the run re-reads and carries on. A second stall straight after a recalculation still fails. The `reorderPlan` resource counts these as `recalculations`.
 
@@ -158,7 +158,7 @@ swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDat
 swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDate=""     # clear
 ```
 
-`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took **and** that the card is still in the same kanban bucket. Done cards and cards someone else edited recently are refused (see **Guards** below), and so is clearing the date of a card in the waiting bucket; `force: true` overrides the last two. The result is recorded as a `vikunjaTask` resource.
+`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took. If the write dropped the card out of its kanban bucket, it moves the card back and verifies that, as `update_task` does (one shared helper), so a `due` op in `apply_plan` never leaves a card out of its column or stops the pass. Done cards and cards someone else edited recently are refused (see **Guards** below), and so is clearing the date of a card in the waiting bucket; `force: true` overrides the last two. The result is recorded as a `vikunjaTask` resource.
 
 ### Editing existing cards: `update_task`, `set_labels`, `move_task`, `close_task`
 
@@ -176,6 +176,16 @@ swamp model method run homelab-backlog close_task  --arg taskId=62 --arg humanIn
 - **`close_task`** sets `done: true`, moves the card into the done bucket, and reads both back. It refuses to run unless `humanInstructed: true`: closing a card is a person's decision. It is safe to re-run on a card that is already closed.
 
 **Guards.** `update_task`, `set_labels`, `move_task` and `set_due_date` refuse done cards, and cards updated within `policy.recentEditMinutes` (default 60) by anything other than this model. A card counts as this model's own when its `updated` matches the one recorded in its `task-<id>` resource by the model's last write, so a card the model just created or edited can be edited again straight away. Pass `force: true` to override; set the policy to `0` to turn the guard off.
+
+### `create_label`
+
+Creates one label. It is the only method that creates labels: `new_task`, `set_labels` and `apply_plan` still refuse an unknown title, so a typo never turns into a new label.
+
+```sh
+swamp model method run homelab-backlog create_label --input-file l.json   # {"title":"ubuntu-26.04","hexColor":"#1973ff","humanInstructed":true}
+```
+
+`title` is required; `hexColor` (six hex digits, `#` optional) and `description` are optional. It reads every page of `GET /labels` first, and when a label with the same title already exists (case-insensitive) it records that label with `status: "exists"` and writes nothing, so a re-run never makes a duplicate. Otherwise it creates the label with `PUT /labels`, reads it back by id, and asserts the title (and the colour and description, when given) took. It refuses to run unless `humanInstructed: true`: labels are the board's shared vocabulary, and unattended runs such as the groomer never create them. The result is a `label` resource named `label-<id>`.
 
 ### `apply_plan`
 
@@ -222,7 +232,7 @@ swamp model method run homelab-backlog board                       # boardSnapsh
 swamp model method run homelab-backlog get_task --arg taskId=62    # vikunjaTask get-62
 ```
 
-- **`board`** writes every card that is not done and not in the done bucket — id, title, full description, bucket and its role, labels, priority, due date, created, updated, position — as one `boardSnapshot` resource, read page by page so no bucket is truncated. A 120-card board with ~670-character descriptions is about 113 KB.
+- **`board`** writes every card that is not done and not in the done bucket — id, title, full description, bucket and its role, labels, priority, due date, created, updated, position — as one `boardSnapshot` resource, read page by page so no bucket is truncated. If the read reaches the 100-page cap with cards still coming, the snapshot (and `audit`'s `boardAudit`) carries `truncated: true` and a warning is logged; the methods that act on the board (writes, `reorder`, `due_report`, label resolution) refuse a truncated read instead. A 120-card board with ~670-character descriptions is about 113 KB.
 - **`get_task`** writes one card plus the bucket (and role) it sits in, as the `vikunjaTask` resource `get-<id>`. Not `task-<id>`: that name records this model's own last write, which the recent-edit guard trusts, so a read must not overwrite it.
 
 ### Board shape and thresholds
@@ -249,10 +259,13 @@ globalArguments:
 ## Resources
 
 - `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
+- `label` — one `create_label` run: `id`, `title`, `hexColor`, `description`, and `status` (`created` or `exists`), named `label-<id>`.
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
-- `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
-- `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `recalculations`, `converged`.
-- `boardSnapshot` — every open card on a board (see `board`) with per-bucket counts.
+- `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, the ready-column roll-up, and `truncated`.
+
+The resources this model builds (`summary`, `boardAudit`, `reorderPlan`, `dueReport`, `boardSnapshot`, `planResult`, `label`) hold exactly their documented fields: unknown keys are stripped. `vikunjaTask` deliberately keeps every field Vikunja returned (`index`, `identifier`, `percent_done`, …), because it is the task as read back and its readers use fields the schema does not list.
+- `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `movesByBucket`, `repeatedMoves` (cards moved more than once), `recalculations`, `converged`, and `error` (why an apply run stopped, else null). It is written even when the run fails.
+- `boardSnapshot` — every open card on a board (see `board`) with per-bucket counts, and `truncated`.
 - `planResult` — one `apply_plan` run: outcome, problems, per-op status.
 - `dueReport` — one due-date pass: `overdue`, `dueToday`, `upcoming` (each `id`, `title`, `bucket`, `dueDate`, `daysUntil`, `url`), `counts` (incl. `actionable`), the Markdown `message`, and `boardUrl`.
 
@@ -262,4 +275,4 @@ globalArguments:
 - Rate limiting: retries transparently on HTTP 429 (`maxRetries`, default 5), honoring `Retry-After`.
 - `POST /tasks/{id}` is a **full replace** in Vikunja. Every method that writes a task body (`update_task`, `set_due_date`, `close_task`) reads the whole task, merges, writes the whole object back, and re-reads.
 - Bucket moves use `POST /projects/{project}/views/{view}/buckets/{bucket}/tasks` (Vikunja ≥ 0.24 / v2.x).
-- Labels: titles are mapped to ids by reading every page of `GET /labels` (the server caps a page at `max_items_per_page`), then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written.
+- Labels: titles are mapped to ids by reading every page of `GET /labels` (the server caps a page at `max_items_per_page`), then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written; create the label with `create_label` first.
