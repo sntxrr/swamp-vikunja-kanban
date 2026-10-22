@@ -274,7 +274,22 @@ const ReorderPlanSchema = z.object({
     "True when the final re-read of every bucket matched the intended " +
       "order (always false on a dry run that still has pending moves).",
   ),
-  iterations: z.number(),
+  iterations: z.number().describe("Single-card moves made, all buckets."),
+  movesByBucket: z.record(z.string(), z.number()).default({}).describe(
+    "Moves made per bucket title; each bucket has its own budget.",
+  ),
+  repeatedMoves: z.array(z.object({
+    taskId: z.number(),
+    bucket: z.string(),
+    moves: z.number(),
+  })).default([]).describe(
+    "Cards moved more than once in this run: a card that keeps moving is " +
+      "the sign of a move that does not stick.",
+  ),
+  error: z.string().nullable().default(null).describe(
+    "Why an apply run stopped, or null. The plan is written before the " +
+      "method throws, so a failed run still leaves its evidence.",
+  ),
   recalculations: z.number().default(0).describe(
     "Full position recalculations the run triggered (a cramped gap or a " +
       "Vikunja 4028); 0 on a dry run.",
@@ -636,7 +651,9 @@ const ReorderArgsSchema = z.object({
       "except the done role.",
   ),
   maxIterations: z.number().int().min(1).max(500).default(100).describe(
-    "Upper bound on single-card moves before reorder gives up.",
+    "Move budget PER BUCKET: reorder gives up on a bucket after " +
+      "max(maxIterations, 2 x its card count) single-card moves in it. One " +
+      "long bucket no longer spends the budget of the buckets after it.",
   ),
 });
 type ReorderArgs = z.infer<typeof ReorderArgsSchema>;
@@ -1930,6 +1947,20 @@ export function nextMove(
   return null;
 }
 
+/** How many entries per bucket, in first-seen order. */
+function countBy(
+  made: Array<{ bucket: string }>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const m of made) out[m.bucket] = (out[m.bucket] ?? 0) + 1;
+  return out;
+}
+
+function formatCounts(counts: Record<string, number>): string {
+  const parts = Object.entries(counts).map(([k, n]) => `${k} ${n}`);
+  return parts.length ? parts.join(", ") : "none";
+}
+
 /** Whether an error is Vikunja's 4028 "needs full view recalculation". */
 function isNeedsRecalculation(err: unknown): boolean {
   return err instanceof Error && /"code":\s*4028\b/.test(err.message);
@@ -2874,80 +2905,125 @@ async function reorder(
   let iterations = 0;
   let recalculations = 0;
   let converged = moves.length === 0;
+  let error: string | null = null;
+  // Every move made, in order, for the per-bucket counts and the repeats.
+  const made: Array<{ taskId: number; bucket: string }> = [];
+  const movesIn = (bucket: string) =>
+    made.filter((m) => m.bucket === bucket).length;
+  const repeatedMoves = () => {
+    const counts = new Map<
+      string,
+      { taskId: number; bucket: string; moves: number }
+    >();
+    for (const m of made) {
+      const k = `${m.bucket}\u0000${m.taskId}`;
+      const c = counts.get(k) ?? { ...m, moves: 0 };
+      c.moves++;
+      counts.set(k, c);
+    }
+    return [...counts.values()].filter((c) => c.moves > 1)
+      .sort((a, b) => b.moves - a.moves || a.taskId - b.taskId);
+  };
   if (args.apply && moves.length > 0) {
-    // True between a recalculation and the next successful move: a second
-    // cramped gap or 4028 in that window means respacing did not help.
-    let justRecalculated = false;
-    const recalculate = async (b: BoardBucket, reason: string) => {
-      if (justRecalculated) {
-        throw new Error(
-          `reorder: ${reason} in bucket "${b.title}" straight after a full ` +
-            "position recalculation; giving up.",
-        );
-      }
-      const first = orderOf(b)[0];
-      await recalculatePositions(g, viewId, first.id);
-      recalculations++;
-      justRecalculated = true;
-      ctx.logger?.info(
-        "Recalculated view {viewId} positions ({reason}, via #{taskId})",
-        { viewId, reason, taskId: first.id, bucket: b.title },
-      );
-      board = await fetchBoard(g, projectId, viewId);
-    };
-    for (
-      const bucketTitle of board.filter((b) => inScope(b.title)).map((b) =>
-        b.title
-      )
-    ) {
-      for (;;) {
-        const b = board.find((x) => x.title === bucketTitle);
-        if (!b) {
-          throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
-        }
-        const move = nextMove(b.tasks, orderOf(b));
-        if (!move) break;
-        if (move.cramped) {
-          await recalculate(b, "gap below minimum spacing");
-          continue;
-        }
-        if (iterations >= args.maxIterations) {
+    try {
+      // True between a recalculation and the next successful move: a second
+      // cramped gap or 4028 in that window means respacing did not help.
+      let justRecalculated = false;
+      const recalculate = async (b: BoardBucket, reason: string) => {
+        if (justRecalculated) {
           throw new Error(
-            `reorder did not converge after ${iterations} moves (bucket "${bucketTitle}" still out of order).`,
+            `reorder: ${reason} in bucket "${b.title}" straight after a ` +
+              "full position recalculation; giving up.",
           );
         }
-        iterations++;
-        try {
-          await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
-            body: {
-              project_view_id: viewId,
-              task_id: move.task.id,
-              position: move.position,
-            },
-          });
-        } catch (err) {
-          if (!isNeedsRecalculation(err)) throw err;
-          await recalculate(b, "Vikunja 4028");
-          continue;
-        }
-        justRecalculated = false;
-        ctx.logger?.info("Moved #{taskId} to slot {slot} in {bucket}", {
-          taskId: move.task.id,
-          slot: move.index,
-          bucket: bucketTitle,
-          position: move.position,
-        });
-        // Vikunja may not store the exact number sent — always re-read.
+        const first = orderOf(b)[0];
+        await recalculatePositions(g, viewId, first.id);
+        recalculations++;
+        justRecalculated = true;
+        ctx.logger?.info(
+          "Recalculated view {viewId} positions ({reason}, via #{taskId})",
+          { viewId, reason, taskId: first.id, bucket: b.title },
+        );
         board = await fetchBoard(g, projectId, viewId);
+      };
+      for (
+        const bucketTitle of board.filter((b) => inScope(b.title)).map((b) =>
+          b.title
+        )
+      ) {
+        // Each bucket gets its own budget, scaled to its size: a sort of n
+        // cards needs at most n - 1 moves when every move sticks.
+        const start = board.find((x) => x.title === bucketTitle);
+        const budget = Math.max(
+          args.maxIterations,
+          2 * (start?.tasks.length ?? 0),
+        );
+        for (;;) {
+          const b = board.find((x) => x.title === bucketTitle);
+          if (!b) {
+            throw new Error(`Bucket "${bucketTitle}" vanished mid-reorder.`);
+          }
+          const move = nextMove(b.tasks, orderOf(b));
+          if (!move) break;
+          if (move.cramped) {
+            await recalculate(b, "gap below minimum spacing");
+            continue;
+          }
+          if (movesIn(bucketTitle) >= budget) {
+            const repeats = repeatedMoves().filter((r) =>
+              r.bucket === bucketTitle
+            );
+            throw new Error(
+              `reorder did not converge in bucket "${bucketTitle}" after ` +
+                `${movesIn(bucketTitle)} moves there (budget ${budget}). ` +
+                `Moves per bucket: ${formatCounts(countBy(made))}. ` +
+                (repeats.length
+                  ? `Cards moved more than once in "${bucketTitle}": ` +
+                    repeats.slice(0, 10).map((r) => `#${r.taskId} x${r.moves}`)
+                      .join(", ") +
+                    "."
+                  : `No card in "${bucketTitle}" moved twice.`),
+            );
+          }
+          iterations++;
+          try {
+            await vreq(g, "POST", `/tasks/${move.task.id}/position`, {
+              body: {
+                project_view_id: viewId,
+                task_id: move.task.id,
+                position: move.position,
+              },
+            });
+          } catch (err) {
+            iterations--;
+            if (!isNeedsRecalculation(err)) throw err;
+            await recalculate(b, "Vikunja 4028");
+            continue;
+          }
+          made.push({ taskId: move.task.id, bucket: bucketTitle });
+          justRecalculated = false;
+          ctx.logger?.info("Moved #{taskId} to slot {slot} in {bucket}", {
+            taskId: move.task.id,
+            slot: move.index,
+            bucket: bucketTitle,
+            position: move.position,
+          });
+          // Vikunja may not store the exact number sent — always re-read.
+          board = await fetchBoard(g, projectId, viewId);
+        }
       }
-    }
-    converged = board.filter((b) => inScope(b.title)).every((b) =>
-      sameOrder(b.tasks, orderOf(b))
-    );
-    if (!converged) {
-      throw new Error(
-        "reorder finished its moves but a final re-read is still out of order.",
+      converged = board.filter((b) => inScope(b.title)).every((b) =>
+        sameOrder(b.tasks, orderOf(b))
       );
+      if (!converged) {
+        throw new Error(
+          "reorder finished its moves but a final re-read is still out of " +
+            "order.",
+        );
+      }
+    } catch (err) {
+      converged = false;
+      error = err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -2958,14 +3034,20 @@ async function reorder(
     applied: args.apply,
     converged,
     iterations,
+    movesByBucket: countBy(made),
+    repeatedMoves: repeatedMoves(),
+    error,
     recalculations,
     moves,
   });
+  // Written before any throw: a run that gave up still leaves the moves it
+  // made, per bucket, for triage.
   const handle = await ctx.writeResource(
     "reorderPlan",
     `reorder-${projectId}`,
     plan,
   );
+  if (error !== null) throw new Error(error);
   if (args.apply) {
     ctx.logger?.info(
       "Reordered project {projectId}: {moves} moves, {recalculations} " +

@@ -52,6 +52,8 @@ class FakeVikunja {
   bucketOf = new Map<number, number>();
   /** View-20 positions; a card without one sits at its id, as before. */
   positions = new Map<number, number>();
+  /** Position writes for these cards answer 200 but are not stored. */
+  stuckPositions = new Set<number>();
   /** Answer the next N non-recalculating position writes with a 4028. */
   fail4028 = 0;
   /** How many full recalculations a position write triggered. */
@@ -107,6 +109,7 @@ class FakeVikunja {
    */
   setPosition(id: number, position: number): [number, unknown] {
     const MIN = 0.01;
+    if (this.stuckPositions.has(id)) return [200, {}];
     this.positions.set(id, position);
     if (position < MIN) {
       this.recalculations++;
@@ -1468,6 +1471,91 @@ Deno.test("a reorder dry run never recalculates", async () => {
   });
   assertStrictEquals(f.recalculations, 0);
   assertEquals(f.writes, []);
+});
+
+/**
+ * `n` cards in `bucket`, created oldest-last so that, at equal priority,
+ * the bucket is in exactly reverse order (every slot but the middle wrong).
+ * Positions are 65536 apart, so no gap is cramped. Waiting cards get due
+ * dates in the same reverse order.
+ */
+function reversed(f: FakeVikunja, bucket: number, n: number): number[] {
+  const ids: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const created = new Date(Date.UTC(2026, 0, 1) + (n - i) * 3_600_000)
+      .toISOString();
+    const due = new Date(Date.UTC(2026, 10, 1) + (n - i) * 86_400_000)
+      .toISOString();
+    const id = f.seed({
+      bucket,
+      priority: 2,
+      created,
+      ...(bucket === 14 ? { due_date: due } : {}),
+    });
+    f.positions.set(id, 65_536 * (ids.length + 1) + bucket * 1e7);
+    ids.push(id);
+  }
+  return ids;
+}
+const order = (f: FakeVikunja, bucket: number) =>
+  [...f.bucketOf].filter(([, b]) => b === bucket).map(([t]) => t)
+    .sort((a, b) => f.pos(a) - f.pos(b) || a - b);
+
+Deno.test("reorder: a 99-card bucket then a 4-card bucket converges (per-bucket budget)", async () => {
+  // The live 2026-10-20 shape: 98 moves in Backlog used up one shared
+  // budget of 100, and Waiting was blamed. 98 + 3 moves > 100.
+  const f = new FakeVikunja();
+  const backlog = reversed(f, 10, 99);
+  const waiting = reversed(f, 14, 4);
+  await withFake(f, async (run, store) => {
+    await run("reorder", { apply: true });
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, true);
+    assertStrictEquals(plan.error, null);
+    assertEquals(plan.movesByBucket, { Backlog: 98, Waiting: 3 });
+    assertStrictEquals(plan.iterations, 101);
+    assertEquals(plan.repeatedMoves, []);
+  });
+  assertEquals(order(f, 10), [...backlog].reverse());
+  assertEquals(order(f, 14), [...waiting].reverse());
+});
+
+Deno.test("reorder: non-convergence names the bucket that spent its budget, and writes the plan first", async () => {
+  const f = new FakeVikunja();
+  reversed(f, 10, 6);
+  const waiting = reversed(f, 14, 3);
+  // The card that belongs first in Waiting never takes its position.
+  f.stuckPositions.add(waiting[2]);
+  await withFake(f, async (run, store) => {
+    const err = await assertRejects(
+      () => run("reorder", { apply: true, maxIterations: 4 }),
+      Error,
+      'did not converge in bucket "Waiting" after 6 moves there (budget 6)',
+    );
+    assert(err.message.includes("Moves per bucket: Backlog 5, Waiting 6"));
+    assert(err.message.includes(`#${waiting[2]} x6`));
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, false);
+    assertEquals(plan.movesByBucket, { Backlog: 5, Waiting: 6 });
+    assertEquals(plan.repeatedMoves, [
+      { taskId: waiting[2], bucket: "Waiting", moves: 6 },
+    ]);
+    assert(String(plan.error).includes('bucket "Waiting"'));
+  });
+});
+
+Deno.test("reorder writes its plan before a recalculation give-up, too", async () => {
+  const f = new FakeVikunja();
+  outOfOrder(f, [1000, 2000, 3000]);
+  f.fail4028 = 99;
+  await withFake(f, async (run, store) => {
+    await assertRejects(() => run("reorder", { apply: true }));
+    const plan = store.get("reorder-5")!;
+    assertStrictEquals(plan.converged, false);
+    assertStrictEquals(plan.recalculations, 1);
+    assertStrictEquals(plan.iterations, 0);
+    assert(String(plan.error).includes("straight after a full"));
+  });
 });
 
 // ------------------------------------------------------------- logging

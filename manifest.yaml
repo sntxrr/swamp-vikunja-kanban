@@ -43,7 +43,8 @@ description: |
     by default; apply moves one card at a time and re-reads until the
     board converges. A gap too small to halve, or a Vikunja 4028, makes it
     respace the view first (position below 0.01 triggers Vikunja's full
-    recalculation).
+    recalculation). Each bucket has its own move budget; a run that gives
+    up names that bucket and still writes its reorderPlan.
   - **due_report** — Read-only: split the board's dated, not-done cards into
     overdue / due today / upcoming (lookaheadDays) with a link per card and
     a ready-to-send Markdown message, so a scheduled workflow can nudge on
