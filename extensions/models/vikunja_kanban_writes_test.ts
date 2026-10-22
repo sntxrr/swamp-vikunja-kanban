@@ -33,6 +33,8 @@ class FakeVikunja {
       title: `filler-${String(i + 4).padStart(3, "0")}`,
     })),
   ];
+  /** Every board page adds one more card, and every label page one more label: a list longer than any page cap. */
+  endless = false;
   /** A label create that "succeeds" but drops hex_color. */
   dropLabelColor = false;
   /** Simulate a server that ignores `page` and always returns page 1. */
@@ -174,6 +176,17 @@ class FakeVikunja {
       return [200, { max_items_per_page: 50 }];
     }
     if (method === "GET" && path === "/labels") {
+      if (this.endless) {
+        const n = Number(url.searchParams.get("page") ?? 1);
+        // Full pages, so the short-page stop never fires.
+        return [
+          200,
+          Array.from({ length: 50 }, (_, i) => ({
+            id: 900_000 + n * 50 + i,
+            title: `endless-${n}-${i}`,
+          })),
+        ];
+      }
       return [200, this.page(url, this.labels)];
     }
     if (method === "PUT" && path === "/labels") {
@@ -198,13 +211,19 @@ class FakeVikunja {
       return [200, this.buckets];
     }
     if (method === "GET" && path === "/projects/5/views/20/tasks") {
+      const n = Number(url.searchParams.get("page") ?? 1);
       return [
         200,
         this.buckets.map((b) => ({
           ...b,
-          tasks: [...this.bucketOf].filter(([, bid]) => bid === b.id)
-            .map(([tid]) => ({ ...this.view(tid), position: this.pos(tid) }))
-            .sort((x, y) => x.position - y.position || x.id - y.id),
+          tasks: [
+            ...[...this.bucketOf].filter(([, bid]) => bid === b.id)
+              .map(([tid]) => ({ ...this.view(tid), position: this.pos(tid) }))
+              .sort((x, y) => x.position - y.position || x.id - y.id),
+            ...(this.endless && b.id === 10
+              ? [{ id: 900_000 + n, title: `endless ${n}`, position: 1e9 + n }]
+              : []),
+          ],
         })),
       ];
     }
@@ -960,6 +979,49 @@ Deno.test("no other method creates labels: unknown ones are still refused", asyn
   assertStrictEquals(f.labels.length, 120);
 });
 
+Deno.test("set_due_date moves the card back when the write un-buckets it", async () => {
+  // Failed on 2026.10.15.1 with "un-bucketed it; move it back by hand".
+  const f = new FakeVikunja();
+  const id = f.seed({ bucket: 14, due_date: "2026-11-04T17:00:00Z" });
+  f.unbucketOnWrite = true;
+  await withFake(f, async (run, store) => {
+    await run("set_due_date", { taskId: id, dueDate: "2026-11-09T17:00:00Z" });
+    // Recorded with the card's latest `updated` (after the move back), so
+    // an edit straight after counts as ours.
+    assertStrictEquals(
+      store.get(`task-${id}`)!.updated,
+      f.tasks.get(id)!.updated,
+    );
+    await run("update_task", { taskId: id, priority: 4 });
+  });
+  assertStrictEquals(bucketTitle(f, id), "Waiting");
+  assertStrictEquals(f.tasks.get(id)!.due_date, "2026-11-09T17:00:00Z");
+  assert(
+    f.logs.some((l) =>
+      l.level === "warning" && l.msg.includes("moved it back")
+    ),
+  );
+});
+
+Deno.test("apply_plan: a due op that un-buckets a card does not stop the pass", async () => {
+  const f = new FakeVikunja();
+  const a = f.seed({ bucket: 14, due_date: "2026-11-04T17:00:00Z" });
+  const b = f.seed({ bucket: 12 });
+  f.unbucketOnWrite = true;
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", {
+      apply: true,
+      ops: [
+        { op: "due", taskId: a, dueDate: "2026-11-10T17:00:00Z" },
+        { op: "update", taskId: b, priority: 4 },
+      ],
+    });
+    assertEquals(planOf(store).outcome, "applied");
+  });
+  assertStrictEquals(bucketTitle(f, a), "Waiting");
+  assertStrictEquals(bucketTitle(f, b), "Doing");
+});
+
 // -------------------------------------------------------------- set_labels
 
 Deno.test("set_labels adds and removes by title, case-insensitively", async () => {
@@ -1555,6 +1617,82 @@ Deno.test("reorder writes its plan before a recalculation give-up, too", async (
     assertStrictEquals(plan.recalculations, 1);
     assertStrictEquals(plan.iterations, 0);
     assert(String(plan.error).includes("straight after a full"));
+  });
+});
+
+// ------------------------------------------------------------ truncation
+
+Deno.test("board and audit report truncated: false on a normal board", async () => {
+  const f = new FakeVikunja();
+  f.seed();
+  await withFake(f, async (run, store) => {
+    await run("board", {});
+    await run("audit", {});
+    assertStrictEquals(store.get("board-5")!.truncated, false);
+    assertStrictEquals(store.get("audit-5")!.truncated, false);
+  });
+});
+
+Deno.test("board and audit surface a board cut off at the page cap", async () => {
+  const f = new FakeVikunja();
+  f.seed();
+  f.endless = true;
+  await withFake(f, async (run, store) => {
+    await run("board", {});
+    await run("audit", {});
+    assertStrictEquals(store.get("board-5")!.truncated, true);
+    assertStrictEquals(store.get("audit-5")!.truncated, true);
+  });
+  const pages = f.reads.filter((r) =>
+    r.startsWith("/projects/5/views/20/tasks?")
+  );
+  assertStrictEquals(pages.length, 2 * 100);
+  assertStrictEquals(
+    f.logs.filter((l) => l.level === "warning" && l.msg.includes("truncated"))
+      .length,
+    2,
+  );
+});
+
+Deno.test("writes refuse to act on a truncated board or label list", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed();
+  f.endless = true;
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () =>
+        run("set_due_date", { taskId: id, dueDate: "2026-11-04T17:00:00Z" }),
+      Error,
+      "truncated board",
+    );
+    await assertRejects(
+      () => run("create_label", { title: "zz-new", humanInstructed: true }),
+      Error,
+      "truncated list",
+    );
+    assertEquals(store.size, 0);
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("vikunjaTask keeps Vikunja's unlisted fields; own resources are exact", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed({ identifier: "#7", percent_done: 0.5 });
+  await withFake(f, async (run, store) => {
+    await run("get_task", { taskId: id });
+    await run("board", {});
+    const rec = store.get(`get-${id}`)!;
+    assertStrictEquals(rec.identifier, "#7");
+    assertStrictEquals(rec.percent_done, 0.5);
+    assertEquals(Object.keys(store.get("board-5")!).sort(), [
+      "buckets",
+      "cards",
+      "fetchedAt",
+      "projectId",
+      "total",
+      "truncated",
+      "viewId",
+    ]);
   });
 });
 

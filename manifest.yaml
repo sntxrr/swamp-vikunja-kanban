@@ -31,7 +31,8 @@ description: |
     nothing unless every op is valid, then run them in order with
     read-backs, stopping at the first failure. Records a planResult.
   - **board** — Read-only: every open card (full description, bucket and
-    role, labels, priority, due date) as one boardSnapshot resource.
+    role, labels, priority, due date) as one boardSnapshot resource, with
+    truncated: true if the read hit the page cap.
   - **get_task** — Read-only: one card and the bucket it sits in.
   - **list_recent** — List the most recently created tasks in a project.
   - **audit** — Read-only Definition-of-Ready audit of the whole board:
@@ -50,8 +51,9 @@ description: |
     a ready-to-send Markdown message, so a scheduled workflow can nudge on
     a card's due date.
   - **set_due_date** — Set or clear one card's due date via a full-task
-    read-modify-write, refusing done cards and asserting on read-back that
-    the date took and the bucket did not change.
+    read-modify-write, refusing done cards, asserting on read-back that the
+    date took, and moving the card back (verified) if the write dropped it
+    out of its bucket.
   - **update_task** — Change one card's title, description and/or priority
     via a full-task read-modify-write, asserting each field on read-back and
     moving the card back if the write dropped it out of its bucket.

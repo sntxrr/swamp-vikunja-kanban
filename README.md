@@ -158,7 +158,7 @@ swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDat
 swamp model method run homelab-backlog set_due_date --arg taskId=62 --arg dueDate=""     # clear
 ```
 
-`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took **and** that the card is still in the same kanban bucket. Done cards and cards someone else edited recently are refused (see **Guards** below), and so is clearing the date of a card in the waiting bucket; `force: true` overrides the last two. The result is recorded as a `vikunjaTask` resource.
+`POST /tasks/{id}` is a **full replace** in Vikunja, so this reads the whole task, changes only `due_date`, writes the whole task back, then re-reads and asserts that the date took. If the write dropped the card out of its kanban bucket, it moves the card back and verifies that, as `update_task` does (one shared helper), so a `due` op in `apply_plan` never leaves a card out of its column or stops the pass. Done cards and cards someone else edited recently are refused (see **Guards** below), and so is clearing the date of a card in the waiting bucket; `force: true` overrides the last two. The result is recorded as a `vikunjaTask` resource.
 
 ### Editing existing cards: `update_task`, `set_labels`, `move_task`, `close_task`
 
@@ -232,7 +232,7 @@ swamp model method run homelab-backlog board                       # boardSnapsh
 swamp model method run homelab-backlog get_task --arg taskId=62    # vikunjaTask get-62
 ```
 
-- **`board`** writes every card that is not done and not in the done bucket — id, title, full description, bucket and its role, labels, priority, due date, created, updated, position — as one `boardSnapshot` resource, read page by page so no bucket is truncated. A 120-card board with ~670-character descriptions is about 113 KB.
+- **`board`** writes every card that is not done and not in the done bucket — id, title, full description, bucket and its role, labels, priority, due date, created, updated, position — as one `boardSnapshot` resource, read page by page so no bucket is truncated. If the read reaches the 100-page cap with cards still coming, the snapshot (and `audit`'s `boardAudit`) carries `truncated: true` and a warning is logged; the methods that act on the board (writes, `reorder`, `due_report`, label resolution) refuse a truncated read instead. A 120-card board with ~670-character descriptions is about 113 KB.
 - **`get_task`** writes one card plus the bucket (and role) it sits in, as the `vikunjaTask` resource `get-<id>`. Not `task-<id>`: that name records this model's own last write, which the recent-edit guard trusts, so a read must not overwrite it.
 
 ### Board shape and thresholds
@@ -261,9 +261,11 @@ globalArguments:
 - `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
 - `label` — one `create_label` run: `id`, `title`, `hexColor`, `description`, and `status` (`created` or `exists`), named `label-<id>`.
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
-- `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
+- `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, the ready-column roll-up, and `truncated`.
+
+The resources this model builds (`summary`, `boardAudit`, `reorderPlan`, `dueReport`, `boardSnapshot`, `planResult`, `label`) hold exactly their documented fields: unknown keys are stripped. `vikunjaTask` deliberately keeps every field Vikunja returned (`index`, `identifier`, `percent_done`, …), because it is the task as read back and its readers use fields the schema does not list.
 - `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `movesByBucket`, `repeatedMoves` (cards moved more than once), `recalculations`, `converged`, and `error` (why an apply run stopped, else null). It is written even when the run fails.
-- `boardSnapshot` — every open card on a board (see `board`) with per-bucket counts.
+- `boardSnapshot` — every open card on a board (see `board`) with per-bucket counts, and `truncated`.
 - `planResult` — one `apply_plan` run: outcome, problems, per-op status.
 - `dueReport` — one due-date pass: `overdue`, `dueToday`, `upcoming` (each `id`, `title`, `bucket`, `dueDate`, `daysUntil`, `url`), `counts` (incl. `actionable`), the Markdown `message`, and `boardUrl`.
 
