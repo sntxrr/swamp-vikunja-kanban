@@ -177,6 +177,16 @@ swamp model method run homelab-backlog close_task  --arg taskId=62 --arg humanIn
 
 **Guards.** `update_task`, `set_labels`, `move_task` and `set_due_date` refuse done cards, and cards updated within `policy.recentEditMinutes` (default 60) by anything other than this model. A card counts as this model's own when its `updated` matches the one recorded in its `task-<id>` resource by the model's last write, so a card the model just created or edited can be edited again straight away. Pass `force: true` to override; set the policy to `0` to turn the guard off.
 
+### `create_label`
+
+Creates one label. It is the only method that creates labels: `new_task`, `set_labels` and `apply_plan` still refuse an unknown title, so a typo never turns into a new label.
+
+```sh
+swamp model method run homelab-backlog create_label --input-file l.json   # {"title":"ubuntu-26.04","hexColor":"#1973ff","humanInstructed":true}
+```
+
+`title` is required; `hexColor` (six hex digits, `#` optional) and `description` are optional. It reads every page of `GET /labels` first, and when a label with the same title already exists (case-insensitive) it records that label with `status: "exists"` and writes nothing, so a re-run never makes a duplicate. Otherwise it creates the label with `PUT /labels`, reads it back by id, and asserts the title (and the colour and description, when given) took. It refuses to run unless `humanInstructed: true`: labels are the board's shared vocabulary, and unattended runs such as the groomer never create them. The result is a `label` resource named `label-<id>`.
+
 ### `apply_plan`
 
 Batches card writes into **one** method run — each swamp CLI call has a fixed cost, so a grooming pass should be one dry run and one apply, not dozens of calls. `ops` is a list discriminated on `op`:
@@ -249,6 +259,7 @@ globalArguments:
 ## Resources
 
 - `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
+- `label` — one `create_label` run: `id`, `title`, `hexColor`, `description`, and `status` (`created` or `exists`), named `label-<id>`.
 - `summary` — per-listing summary: scope, endpoint, total count, item ids.
 - `boardAudit` — one audit run: per-bucket counts and order state, every finding (`taskId`, `bucket`, `role`, `rule`, `severity`, `detail`), counts by rule and severity, and the ready-column roll-up.
 - `reorderPlan` — one reorder run: the moves planned or performed (`taskId`, `bucket`, `from`, `to`), `applied`, `iterations`, `recalculations`, `converged`.
@@ -262,4 +273,4 @@ globalArguments:
 - Rate limiting: retries transparently on HTTP 429 (`maxRetries`, default 5), honoring `Retry-After`.
 - `POST /tasks/{id}` is a **full replace** in Vikunja. Every method that writes a task body (`update_task`, `set_due_date`, `close_task`) reads the whole task, merges, writes the whole object back, and re-reads.
 - Bucket moves use `POST /projects/{project}/views/{view}/buckets/{bucket}/tasks` (Vikunja ≥ 0.24 / v2.x).
-- Labels: titles are mapped to ids by reading every page of `GET /labels` (the server caps a page at `max_items_per_page`), then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written.
+- Labels: titles are mapped to ids by reading every page of `GET /labels` (the server caps a page at `max_items_per_page`), then attached with `PUT /tasks/{id}/labels` and detached with `DELETE /tasks/{id}/labels/{label}`; labels never go in the task body. An unknown title is always an error, raised before anything is written; create the label with `create_label` first.

@@ -61,6 +61,11 @@ description: |
     Definition of Ready and waiting a due date, unless force: true.
   - **close_task** — Mark one card done and move it into the done bucket;
     runs only with humanInstructed: true.
+  - **create_label** — Create one label (title, optional hexColor and
+    description), idempotently: an existing title (case-insensitive,
+    every page read) is returned instead of a duplicate, and a new one is
+    read back. Runs only with humanInstructed: true; no other method
+    creates labels.
 
   The edit methods (update_task, set_labels, move_task, set_due_date)
   refuse done cards and cards someone else updated within

@@ -288,6 +288,22 @@ const ReorderPlanSchema = z.object({
   })),
 }).passthrough();
 
+const LabelSchema = z.object({
+  id: z.number().describe("Vikunja label id."),
+  title: z.string().describe("Label title as stored."),
+  hexColor: z.string().nullable().describe(
+    "Colour as Vikunja stores it (six hex digits, no #), or null.",
+  ),
+  description: z.string().nullable(),
+  status: z.enum(["created", "exists"]).describe(
+    "created: this run made the label. exists: a label with this title " +
+      "(case-insensitive) was already there, and nothing was written.",
+  ),
+  fetchedAt: z.string(),
+});
+/** The `label` resource written by create_label. */
+export type LabelRecord = z.infer<typeof LabelSchema>;
+
 const DueItemSchema = z.object({
   id: z.number(),
   title: z.string(),
@@ -414,8 +430,8 @@ export type PlanResult = z.infer<typeof PlanResultSchema>;
 
 const LabelName = z.string().min(1).describe(
   "Label title to attach to the task (case-insensitive), resolved via " +
-    "GET /labels. Must already exist on the Vikunja instance — this model " +
-    "never creates labels.",
+    "GET /labels. Must already exist on the Vikunja instance: only " +
+    "create_label creates labels, never as a side effect of another write.",
 );
 
 const ProjectIdOverride = z.number().int().positive().optional().describe(
@@ -586,6 +602,23 @@ const CloseTaskArgsSchema = z.object({
       "to state that a person asked for it.",
   ),
   projectId: BoardProject,
+});
+
+const CreateLabelArgsSchema = z.object({
+  title: z.string().trim().min(1, "title must not be empty").describe(
+    "Label title. An existing label with this title (case-insensitive) is " +
+      "returned instead of creating a duplicate.",
+  ),
+  hexColor: z.string().trim().regex(
+    /^#?[0-9a-fA-F]{6}$/,
+    "hexColor must be six hex digits, with or without a leading #",
+  ).optional().describe("Optional colour, e.g. 1973ff or #1973ff."),
+  description: z.string().optional().describe("Optional label description."),
+  humanInstructed: z.boolean().default(false).describe(
+    "Must be true. Labels are the board's shared vocabulary, so a caller " +
+      "has to state that a person asked for this one; unattended runs (the " +
+      "groomer) never create labels.",
+  ),
 });
 
 const ReorderArgsSchema = z.object({
@@ -894,7 +927,7 @@ async function fetchAllLabels(g: GlobalArgs): Promise<Map<string, LabelRef>> {
  * Resolve label titles (case-insensitive) to their ids against `known`
  * (from fetchAllLabels, which reads every page of GET /labels),
  * de-duplicated. Throws naming every unknown title and listing the known
- * ones. This model never creates labels.
+ * ones. Only create_label creates labels; no other write does it implicitly.
  */
 function resolveLabels(
   known: Map<string, LabelRef>,
@@ -910,7 +943,7 @@ function resolveLabels(
   if (unknown.length) {
     throw new Error(
       `Label(s) not found on this Vikunja instance: ${unknown.join(", ")} ` +
-        `(labels are never created here); known: ` +
+        `(create them with create_label first); known: ` +
         [...known.values()].map((l) => l.title).sort().join(", "),
     );
   }
@@ -2704,6 +2737,98 @@ async function closeTask(
   return { dataHandles: [handle] };
 }
 
+/**
+ * Create one label, idempotently: every page of GET /labels is read first,
+ * and a label whose title matches (case-insensitive) is returned as
+ * `exists` instead of being duplicated. A new label is read back by id and
+ * its title (and colour, when given) asserted. Only runs with
+ * humanInstructed: true.
+ */
+async function createLabel(
+  args: z.infer<typeof CreateLabelArgsSchema>,
+  ctx: ExecCtx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const fetchedAt = new Date().toISOString();
+  if (!args.humanInstructed) {
+    throw new Error(
+      "create_label is never automatic: pass humanInstructed: true when a " +
+        "person asked for this label.",
+    );
+  }
+  const title = args.title;
+  const hexColor = args.hexColor?.replace(/^#/, "").toLowerCase();
+
+  const known = await fetchAllLabels(g);
+  const hit = known.get(title.toLowerCase());
+  let raw: Record<string, unknown>;
+  let status: LabelRecord["status"];
+  if (hit) {
+    raw = await vreq(g, "GET", `/labels/${hit.id}`) as Record<string, unknown>;
+    status = "exists";
+  } else {
+    const made = await vreq(g, "PUT", "/labels", {
+      body: {
+        title,
+        ...(hexColor !== undefined ? { hex_color: hexColor } : {}),
+        ...(args.description !== undefined
+          ? { description: args.description }
+          : {}),
+      },
+    }) as Record<string, unknown> | null;
+    if (!made || typeof made.id !== "number") {
+      throw new Error(
+        `Vikunja PUT /labels returned no label id for "${title}"; check ` +
+          "GET /labels before retrying.",
+      );
+    }
+    raw = await vreq(g, "GET", `/labels/${made.id}`) as Record<
+      string,
+      unknown
+    >;
+    const wrong: string[] = [];
+    if (raw.title !== title) wrong.push(`title ${JSON.stringify(raw.title)}`);
+    if (
+      hexColor !== undefined &&
+      String(raw.hex_color ?? "").replace(/^#/, "").toLowerCase() !== hexColor
+    ) wrong.push(`hex_color ${JSON.stringify(raw.hex_color)}`);
+    if (
+      args.description !== undefined && raw.description !== args.description
+    ) wrong.push("description");
+    if (wrong.length) {
+      throw new Error(
+        `Label ${made.id} was created but read back with ${wrong.join(", ")}.`,
+      );
+    }
+    status = "created";
+  }
+
+  const record = LabelSchema.parse({
+    id: raw.id,
+    title: raw.title,
+    hexColor: typeof raw.hex_color === "string" && raw.hex_color !== ""
+      ? raw.hex_color
+      : null,
+    description: typeof raw.description === "string" ? raw.description : null,
+    status,
+    fetchedAt,
+  });
+  const handle = await ctx.writeResource("label", `label-${record.id}`, record);
+  if (status === "exists") {
+    ctx.logger?.info("Label {labelId} {title} already exists; not created", {
+      labelId: record.id,
+      title: record.title,
+      requested: title,
+    });
+  } else {
+    ctx.logger?.info("Created label {labelId} {title}", {
+      labelId: record.id,
+      title: record.title,
+    });
+  }
+  return { dataHandles: [handle] };
+}
+
 async function reorder(
   args: ReorderArgs,
   ctx: ExecCtx,
@@ -3596,6 +3721,13 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
+    label: {
+      description: "One create_label run: the label's id, title, colour and " +
+        "description, and whether it was created or already existed.",
+      schema: LabelSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
     dueReport: {
       description:
         "One due-date pass over a board: overdue, due-today and upcoming " +
@@ -3726,6 +3858,18 @@ export const model = {
         "closing a card is a person's decision.",
       arguments: CloseTaskArgsSchema,
       execute: logged("close_task", closeTask),
+    },
+    create_label: {
+      description:
+        "Create one label (title, optional hexColor and description). " +
+        "Idempotent: every page of labels is read first, and an existing " +
+        "label with the same title (case-insensitive) is returned with " +
+        "status exists instead of a duplicate. A new label is read back by " +
+        "id. Only runs with humanInstructed: true; no other method creates " +
+        "labels (apply_plan, new_task and set_labels still refuse unknown " +
+        "ones). Writes a label resource named label-<id>.",
+      arguments: CreateLabelArgsSchema,
+      execute: logged("create_label", createLabel),
     },
     apply_plan: {
       description:

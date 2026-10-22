@@ -15,6 +15,8 @@ type Task = Record<string, unknown> & { id: number };
 interface Label {
   id: number;
   title: string;
+  hex_color?: string;
+  description?: string;
 }
 
 const OLD = "2026-09-01T00:00:00Z";
@@ -31,6 +33,8 @@ class FakeVikunja {
       title: `filler-${String(i + 4).padStart(3, "0")}`,
     })),
   ];
+  /** A label create that "succeeds" but drops hex_color. */
+  dropLabelColor = false;
   /** Simulate a server that ignores `page` and always returns page 1. */
   ignorePage = false;
   /** Every GET, as "path?query", for asserting how lists were paged. */
@@ -168,6 +172,21 @@ class FakeVikunja {
     }
     if (method === "GET" && path === "/labels") {
       return [200, this.page(url, this.labels)];
+    }
+    if (method === "PUT" && path === "/labels") {
+      const b = body as Partial<Label>;
+      const label: Label = {
+        id: this.labels.reduce((n, l) => Math.max(n, l.id), 0) + 1,
+        title: String(b.title),
+        hex_color: this.dropLabelColor ? "" : b.hex_color ?? "",
+        description: b.description ?? "",
+      };
+      this.labels.push(label);
+      return [201, label];
+    }
+    if (method === "GET" && (m = path.match(/^\/labels\/(\d+)$/))) {
+      const l = this.labels.find((x) => x.id === Number(m![1]));
+      return l ? [200, l] : [404, { message: "label not found" }];
     }
     if (method === "GET" && path === "/projects/5/views") {
       return [200, [{ id: 20, view_kind: "kanban" }]];
@@ -822,6 +841,122 @@ Deno.test("set_due_date refuses done cards and clearing a waiting card's date", 
   assertStrictEquals(f.tasks.get(waiting)!.due_date, "2026-12-01T17:00:00Z");
 });
 
+// ------------------------------------------------------------ create_label
+
+Deno.test("create_label refuses without humanInstructed and reads nothing", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () => run("create_label", { title: "zz-new" }),
+      Error,
+      "humanInstructed: true",
+    );
+    assertEquals(store.size, 0);
+  });
+  assertEquals(f.writes, []);
+  assertEquals(f.reads, []);
+  assertStrictEquals(f.labels.length, 120);
+});
+
+Deno.test("create_label creates once, reads back, and is idempotent", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run, store) => {
+    await run("create_label", {
+      title: "zz-new",
+      hexColor: "#1973FF",
+      description: "made by a test",
+      humanInstructed: true,
+    });
+    const made = f.labels.find((l) => l.title === "zz-new")!;
+    assertStrictEquals(made.hex_color, "1973ff");
+    const rec = store.get(`label-${made.id}`)!;
+    assertEquals(rec.status, "created");
+    assertEquals(rec.id, made.id);
+    assertEquals(rec.hexColor, "1973ff");
+    assertEquals(f.writes, ["PUT /labels"]);
+    // Every page was read before deciding the title is new.
+    assert(
+      f.reads.some((r) => r.startsWith("/labels?") && r.includes("page=3")),
+    );
+
+    // Same title, other case: the existing label, no second PUT.
+    await run("create_label", { title: "ZZ-New", humanInstructed: true });
+    assertEquals(store.get(`label-${made.id}`)!.status, "exists");
+    assertEquals(f.writes, ["PUT /labels"]);
+  });
+  assertStrictEquals(
+    f.labels.filter((l) => /^zz-new$/i.test(l.title)).length,
+    1,
+  );
+});
+
+Deno.test("create_label finds an existing title beyond the first page", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run, store) => {
+    await run("create_label", { title: "FILLER-110", humanInstructed: true });
+    const rec = store.get("label-110")!;
+    assertEquals(rec.status, "exists");
+    assertEquals(rec.title, "filler-110");
+  });
+  assertEquals(f.writes, []);
+});
+
+Deno.test("create_label fails when the colour does not read back", async () => {
+  const f = new FakeVikunja();
+  f.dropLabelColor = true;
+  await withFake(f, async (run, store) => {
+    await assertRejects(
+      () =>
+        run("create_label", {
+          title: "zz-colour",
+          hexColor: "abcdef",
+          humanInstructed: true,
+        }),
+      Error,
+      "read back with hex_color",
+    );
+    assertEquals(store.size, 0);
+  });
+});
+
+Deno.test("create_label refuses a bad colour before any request", async () => {
+  const f = new FakeVikunja();
+  await withFake(f, async (run) => {
+    await assertRejects(() =>
+      run("create_label", {
+        title: "zz-x",
+        hexColor: "blue",
+        humanInstructed: true,
+      })
+    );
+  });
+  assertEquals(f.reads, []);
+});
+
+Deno.test("no other method creates labels: unknown ones are still refused", async () => {
+  const f = new FakeVikunja();
+  const id = f.seed();
+  await withFake(f, async (run, store) => {
+    await run("apply_plan", {
+      ops: [{ op: "labels", taskId: id, add: ["no-such-label"] }],
+    });
+    const r = planOf(store);
+    assertEquals(r.outcome, "dry-run");
+    assert(
+      r.ops[0].problems.join(" | ").includes(
+        "unknown label(s): no-such-label",
+      ),
+    );
+    await assertRejects(
+      () => run("new_task", { title: "x", labels: ["no-such-label"] }),
+      Error,
+      "create_label",
+    );
+  });
+  assert(!f.writes.includes("PUT /labels"));
+  assertStrictEquals(f.labels.length, 120);
+});
+
 // -------------------------------------------------------------- set_labels
 
 Deno.test("set_labels adds and removes by title, case-insensitively", async () => {
@@ -1348,6 +1483,7 @@ Deno.test("every method logs its start, and every message is a constant template
     ["update_task", { taskId: a, priority: 4 }],
     ["update_task", { taskId: a, priority: 4 }], // no change
     ["set_labels", { taskId: a, add: ["automation"] }],
+    ["create_label", { title: "zz-logged", humanInstructed: true }],
     ["move_task", { taskId: a, bucketName: "Doing" }],
     ["move_task", { taskId: a, bucketName: "Doing" }], // already there
     ["set_due_date", { taskId: a, dueDate: "2026-11-04T17:00:00Z" }],
