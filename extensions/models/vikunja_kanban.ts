@@ -3753,7 +3753,7 @@ function logged<A>(
 /** Vikunja kanban orchestrator: create, edit and list tasks via the Vikunja REST API. */
 export const model = {
   type: "@sntxrr/vikunja-kanban" as const,
-  version: "2026.10.15.1",
+  version: "2026.10.22.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3896,6 +3896,24 @@ export const model = {
         "and carries on; a second stall straight after a recalculation " +
         "still fails. The reorderPlan resource gains recalculations " +
         "(default 0). Existing model attributes carry over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.22.1",
+      description:
+        "Added create_label (title, optional hexColor/description; " +
+        "idempotent on a case-insensitive title across every label page; " +
+        "read back; humanInstructed: true required) and the label resource. " +
+        "No other method creates labels. reorder's maxIterations is now a " +
+        "per-bucket budget (max(maxIterations, 2 x cards)); a give-up names " +
+        "the bucket, moves per bucket and repeated cards, and the " +
+        "reorderPlan (new movesByBucket, repeatedMoves, error) is written " +
+        "before the throw. set_due_date moves a card back (verified) when " +
+        "the write drops its bucket, instead of failing. board and audit " +
+        "carry truncated; writes refuse a truncated board or label read. " +
+        "This model's own resource schemas strip unknown keys (vikunjaTask " +
+        "still keeps Vikunja's fields). Global arguments are unchanged, so " +
+        "existing model attributes carry over unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
