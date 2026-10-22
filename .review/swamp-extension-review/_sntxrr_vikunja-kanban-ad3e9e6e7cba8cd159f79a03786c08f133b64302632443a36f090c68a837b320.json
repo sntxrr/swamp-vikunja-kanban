@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.10.22.1",
+  "reviewedAt": "2026-10-22T16:27:59Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "apiToken stays .meta({sensitive:true}) and vault-supplied. create_label adds no credential field; vreq errors carry method/path/status/body only, never the token. Test fixtures use http://vikunja.test and tk_test."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Every new log line is a constant template with structured props (create_label: 'Created label {labelId} {title}' / 'already exists'; restoreBucket warning; warnTruncated warning). The logging test now includes create_label and asserts no digits or task ids are interpolated into message text."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "create_label refuses without humanInstructed before any request (test asserts zero reads), validates hexColor in the schema, and throws naming the label id when a created label reads back wrong. reorder now catches every apply failure, writes the reorderPlan with converged=false and the error, then rethrows, so a failed run is never silent and never loses its evidence. set_due_date restores a dropped bucket and throws only if the move back did not land."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "82 tests (67 before). New: create_label refusal/creation/idempotency (case-insensitive, beyond page 1)/colour read-back/bad colour; apply_plan and new_task still refuse unknown labels; reorder 99-card Backlog + 4-card Waiting converges (fails on 2026.10.15.1), non-convergence names Waiting with per-bucket counts and the repeated card and writes the plan first, 4028 give-up writes the plan; set_due_date bucket restore and apply_plan due op on an un-bucketing server (both fail on 2026.10.15.1); board/audit truncated false/true; writes refuse a truncated board or label read; vikunjaTask keeps unlisted fields while boardSnapshot keys are exact. The fake writeResource still fails any run that writes one instance name twice."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "create_label reads every label page and returns an existing case-insensitive match with status exists, never a duplicate; a truncated label list refuses rather than risking a duplicate. reorder re-reads after every move as before. set_due_date is still a no-op write when the date already matches."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "create_label uses PUT /labels (create) and GET /labels/{id} (read-back), Vikunja v2 label endpoints; hex_color is sent without '#', as Vikunja stores it. Paged reads keep honouring max_items_per_page and now report truncation at the 100-page cap instead of returning silently."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No new handles; every fetch keeps its AbortController timeout. Truncation caps the number of requests at 100 pages per read, as before."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README/manifest examples use generic names (homelab-backlog, example label titles). No internal hosts, IPs, vaults or buckets in code, tests, commit messages or the PR body; the pre-push denylist hook is run on push."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Resolved (#265): the model's own resource schemas (summary, boardAudit, reorderPlan, dueReport, boardSnapshot, planResult, new label) are plain z.object and strip unknown keys; a probe with .strict() on all of them passed the full suite, so no producer relied on extra keys. vikunjaTask and its label refs keep .passthrough() deliberately, with a comment: the record is the task as Vikunja returned it and readers use unlisted fields (index, identifier, ...). New argument schemas are typed with refinements."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "New label spec declares lifetime infinite and garbageCollection 10; the others are unchanged."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Labels gain create (create_label) alongside read; rename/delete are out of scope by design (card #503). Cards: create/read/update/close as before; delete intentionally absent."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "Won't do as swamp checks, with reason (closes the follow-up carried since 2026.09.26.1): the guards need the task as read inside the method (done flag, updated, bucket), apply_plan must apply the same rules per op mid-run where a check cannot run, swamp checks get raw unparsed args and cannot write a record, and a check would add --skip-checks as a second, unlogged bypass beside force/humanInstructed. Instead the rules are named functions shared by every surface: guardProblem/guardWrite, readinessProblems, requireBucketOf, and new clearWaitingDueProblem (set_due_date and apply_plan's due op)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "create_label writes one label-<id> per run. reorder writes reorder-<project> exactly once on success or failure (the catch path writes and rethrows; the success path is not reached). set_due_date still writes task-<id> once, now from a re-read after any bucket restore so the recent-edit guard sees the latest updated."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "The guard reads prior state via context.readResource('task-<id>'); no direct dataRepository access."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "model.version and manifest 2026.10.22.1 with an upgrades entry; global arguments are unchanged, so attributes carry over. New resource fields (truncated, movesByBucket, repeatedMoves, error) have defaults, so earlier stored records still parse."
+    }
+  ]
+}
