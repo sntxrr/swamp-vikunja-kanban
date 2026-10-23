@@ -24,7 +24,7 @@ Built as a homelab-native replacement for `@webframp/hermes-kanban-orchestrator`
    swamp extension pull @sntxrr/vikunja-kanban
    swamp model create @sntxrr/vikunja-kanban homelab-backlog \
      --global-arg baseUrl=https://vikunja.example.com \
-     --global-arg apiToken=REPLACE_WITH_VAULT_EXPRESSION_FOR_vikunja_API_TOKEN \
+     --global-arg 'apiToken=${{ vault.get("vikunja", "API_TOKEN") }}' \
      --global-arg projectId=5
    ```
 
@@ -274,7 +274,7 @@ Capabilities: `assign` (users with access to the project, by username). `history
 ```sh
 swamp model create @sntxrr/vikunja-kanban/tracker vikunja-test \
   --global-arg baseUrl=https://vikunja.example.com \
-  --global-arg apiToken=REPLACE_WITH_VAULT_EXPRESSION \
+  --global-arg 'apiToken=${{ vault.get("vikunja", "API_TOKEN") }}' \
   --global-arg projectId=<test project id>
 swamp model method run vikunja-test describe
 swamp model create @swamp/stagecraft/publisher vikunja-test-pub \

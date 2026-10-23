@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/vikunja-kanban",
+  "version": "2026.10.23.1",
+  "reviewedAt": "2026-10-23T21:38:58Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: apiToken is .meta({sensitive:true}) and vault-wired; the Bearer header is the only place it is used. Failure details carry method, path, status and Vikunja's message only; a test asserts a bad token never appears in the answer. README examples now use ${{ vault.get(...) }} (lines 25 and 275, flagged by secret-unsafe-docs, fixed). vikunja_kanban.ts unchanged."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: describe and operate log a start line and operate a completion line (and an already-answered line), all constant templates with structured props; no token, request body or answer content is logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: by the stagecraft tracker contract every failure is written as an ok:false answer (auth/not_found/rate_limited/invalid/upstream) instead of thrown; HTTP status maps to kind, detail names method/path/status/message. Fixed in review: create rolled back nothing when the label attach failed, so the retried failed answer would file a second card; it now deletes the half-made task and says whether that worked (tested)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "92 tests pass (10 new): an in-memory Vikunja v2.6 runs the contract's check sequence (fetch by id/display, comment read-back, status idempotence, failure kinds, create, assign, each relation on both ends, the relation rules, missing tickets), plus cross-project not_found, bad-token auth, answer idempotency, malformed requests and the create rollback. Live: @swamp/stagecraft/conformance passed on a scratch Vikunja v2.6.0 project (run 6936e9f2, passed:true, 75 calls) on the PR #20 code; the review fixes are re-proven by a conformance run after publish."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: an ok answer is never made again (read before acting); failed answers are retried by the next run. set_status/relate/unrelate/assign report changed:false on repeat. Residual, accepted: a crash between a comment PUT and its answer write re-posts the comment on retry (the contract's ledger names the answer, Vikunja has no idempotency key); a related_to whose direction record failed to write reads by the lower-id fallback."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: routes and bodies checked against the instance's own /api/v1/docs.json (v2.6.0) and exercised by live conformance. Responses are checked before use (task project_id, created id, comment id). Lists page at 50 and now fail upstream past 50 pages instead of truncating silently (fixed in review). 429 honours Retry-After up to maxRetries, then answers rate_limited."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: fetch timers cleared in finally, 429 bodies cancelled, error bodies read. No files or long-lived handles; the kanban view is read once per operation."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README examples use vikunja.example.com, <test project id> and vault expressions; tests use vikunja.test and a public username. No host addresses, internal hostnames or vault paths in README.md, manifest.yaml or extensions/; the pre-push denylist hook scans the release commit."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: fixed in review: answer and description specs used .passthrough(); both are now exact z.object schemas of the contract's fields; relation is {from,to}. vikunja_kanban.ts unchanged."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: answer infinite/30d, description and relation infinite/5."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "vikunja_tracker.ts is a stagecraft tracker, not a CRUD lifecycle: its surface is fixed by contract 1 (describe + operate). vikunja_kanban.ts unchanged since 2026.10.22.1 (pass there)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "Carried won't-do for vikunja_kanban.ts (reason in the 2026.10.22.1 report). The tracker has none by design: the stagecraft contract requires every failure to be written as an answer, and a swamp pre-flight check would throw before operate could write it."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: answer names come from stagecraft (answer-<ledger>), description is 'description', relation records are related-<lo>-<hi>; disjoint prefixes, one write per spec per run."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: reads its own records only through context.readResource (prior answer, relation direction)."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "vikunja_tracker.ts: first version 2026.10.23.1 with an identity upgrades[] entry (version-bump-upgrade check satisfied). vikunja_kanban.ts version unchanged."
+    }
+  ]
+}

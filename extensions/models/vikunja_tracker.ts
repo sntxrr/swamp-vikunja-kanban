@@ -220,7 +220,8 @@ async function allPages(
     out.push(...fresh);
     if (fresh.length === 0 || items.length < 50) return out;
   }
-  return out;
+  // A partial list would misreport (an unknown type, missing activity).
+  throw new Failure("upstream", `GET ${path} still had more after 50 pages`);
 }
 
 // ============================================================================
@@ -568,10 +569,20 @@ async function perform(
           body: { label_id: label.id },
         });
       } catch (e) {
+        // Remove the half-made card: a failed answer is retried, and the
+        // retry would otherwise file a second one.
+        const why = e instanceof Error ? e.message : String(e);
+        const removed = await vk(g, "DELETE", `/tasks/${created.id}`).then(
+          () => true,
+          () => false,
+        );
         throw new Failure(
           "upstream",
           `task ${created.id} was created but its type label could not be ` +
-            `attached: ${e instanceof Error ? e.message : String(e)}`,
+            `attached (${why}); ` +
+            (removed
+              ? "the task was deleted again"
+              : "deleting it failed too: remove it by hand"),
         );
       }
       return await board.ticket(await board.task(String(created.id)));
@@ -722,7 +733,29 @@ const OPERATIONS = [
   "link_pr",
 ] as const;
 
-const AnswerSchema = z.object({ ok: z.boolean() }).passthrough();
+const AnswerSchema = z.object({
+  operation: z.string(),
+  run: z.string().optional(),
+  ok: z.boolean(),
+  result: z.record(z.string(), z.unknown()).optional(),
+  kind: z.enum(["auth", "not_found", "rate_limited", "invalid", "upstream"])
+    .optional(),
+  reason: z.literal("unreachable").optional(),
+  detail: z.string().optional(),
+});
+
+const DescriptionSchema = z.object({
+  tracker: z.string(),
+  contract: z.literal(1),
+  origin: z.literal("snapshot"),
+  capabilities: z.object({
+    history: z.boolean(),
+    assign: z.boolean(),
+    pullRequests: z.boolean(),
+  }),
+  closesDuplicates: z.boolean(),
+  assignee: z.string().optional(),
+});
 
 /** The answer operate writes for one operation: its result or its failure. */
 export async function answerFor(
@@ -766,6 +799,15 @@ export const model = {
   type: "@sntxrr/vikunja-kanban/tracker" as const,
   version: "2026.10.23.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.23.1",
+      description:
+        "First version: the stagecraft tracker (contract 1). No earlier " +
+        "attributes to migrate.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     answer: {
       description: "operate's answers, under the names stagecraft gave them",
@@ -775,7 +817,7 @@ export const model = {
     },
     description: {
       description: "What this tracker says of itself, for stagecraft to bind",
-      schema: z.object({ tracker: z.string() }).passthrough(),
+      schema: DescriptionSchema,
       lifetime: "infinite" as const,
       garbageCollection: 5,
     },
@@ -794,6 +836,13 @@ export const model = {
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, ctx: Ctx) => {
         const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        ctx.logger?.info(
+          "describe: tracker {tracker} for project {projectId}",
+          {
+            tracker: TRACKER,
+            projectId: g.projectId,
+          },
+        );
         const handle = await ctx.writeResource("description", "description", {
           tracker: TRACKER,
           contract: 1,
@@ -824,8 +873,17 @@ export const model = {
         },
         ctx: Ctx,
       ) => {
+        ctx.logger?.info("operate {operation} as {answer}", {
+          operation: args.operation,
+          answer: args.answer,
+        });
         const prior = await ctx.readResource(args.answer);
-        if (prior?.ok === true) return { dataHandles: [] };
+        if (prior?.ok === true) {
+          ctx.logger?.info("operate {operation}: already answered", {
+            operation: args.operation,
+          });
+          return { dataHandles: [] };
+        }
         const answer = await answerFor(
           ctx,
           args.operation,

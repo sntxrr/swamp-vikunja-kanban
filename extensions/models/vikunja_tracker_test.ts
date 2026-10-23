@@ -40,6 +40,8 @@ class FakeVikunja {
   nextComment = 9000;
   token = "tk_good";
   calls: string[] = [];
+  /** Answer every label attach with a 500. */
+  failLabels = false;
 
   seed(over: Raw = {}, projectId = this.projectId): number {
     const id = this.nextId++;
@@ -136,6 +138,10 @@ class FakeVikunja {
       if (!task) return json({ message: "The task does not exist." }, 404);
       const rest = m[2] ?? "";
       if (method === "GET" && rest === "") return json(this.view(task));
+      if (method === "DELETE" && rest === "") {
+        this.tasks.delete(id);
+        return json({ message: "deleted" });
+      }
       if (method === "GET" && rest === "/comments") {
         return paged(this.comments.get(id) ?? []);
       }
@@ -148,6 +154,9 @@ class FakeVikunja {
         };
         this.comments.set(id, [...(this.comments.get(id) ?? []), c]);
         return json(c, 201);
+      }
+      if (method === "PUT" && rest === "/labels" && this.failLabels) {
+        return json({ message: "boom" }, 500);
       }
       if (method === "PUT" && rest === "/labels") {
         const l = this.labels.find((l) => l.id === body!.label_id)!;
@@ -503,5 +512,17 @@ Deno.test("a request that is not a JSON object is an invalid answer", async () =
       const a = await op("fetch_issue", request);
       assertEquals([a.ok, a.kind], [false, "invalid"]);
     }
+  });
+});
+
+Deno.test("create rolls back a task whose type label fails to attach", async () => {
+  const fake = new FakeVikunja();
+  fake.failLabels = true;
+  const { op } = harness(fake);
+  await withFetch(fake, async () => {
+    const a = await op("create", { title: "T", body: "", type: "automation" });
+    assertEquals([a.ok, a.kind], [false, "upstream"]);
+    assert(String(a.detail).includes("deleted again"), String(a.detail));
+    assertEquals(fake.tasks.size, 0, "no half-made card left behind");
   });
 });
