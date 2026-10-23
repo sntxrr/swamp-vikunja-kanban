@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@sntxrr/vikunja-kanban"
-version: "2026.10.22.1"
+version: "2026.10.23.1"
 description: |
   Vikunja kanban orchestrator — creates tasks in a Vikunja project directly
   via the Vikunja REST API and records each as a swamp data resource with its
@@ -73,12 +73,23 @@ description: |
   The edit methods (update_task, set_labels, move_task, set_due_date)
   refuse done cards and cards someone else updated within
   policy.recentEditMinutes unless force: true.
+
+  ## Tracker for @swamp/stagecraft
+
+  A second model, **@sntxrr/vikunja-kanban/tracker**, is a stagecraft
+  tracker (contract 1): put a @swamp/stagecraft/publisher in front of it
+  and stagecraft's publish / claim / create / fetch-issue /
+  mark-duplicate workflows file, comment on, move, relate and assign
+  cards in one Vikunja project. Statuses are kanban bucket titles, types
+  are labels, relations map onto Vikunja's relation kinds, and tasks
+  outside the configured project are not_found.
 license: MIT
 repository: "https://github.com/sntxrr/swamp-vikunja-kanban"
 paths:
   base: manifest
 models:
   - extensions/models/vikunja_kanban.ts
+  - extensions/models/vikunja_tracker.ts
 labels:
   - vikunja
   - kanban

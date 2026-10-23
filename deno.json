@@ -3,7 +3,7 @@
     "strict": true
   },
   "tasks": {
-    "check": "deno check extensions/models/vikunja_kanban.ts",
+    "check": "deno check extensions/models/vikunja_kanban.ts extensions/models/vikunja_tracker.ts",
     "lint": "deno lint extensions/models/",
     "fmt": "deno fmt extensions/models/",
     "fmt:check": "deno fmt --check extensions/models/",

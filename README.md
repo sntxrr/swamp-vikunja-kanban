@@ -256,6 +256,38 @@ globalArguments:
 
 `waiting` is the column for cards whose only remaining step is a **date** — a scheduled run to observe, a snapshot-drop window, an expiry. Its due date means "look at it again on this day" (what `due_report` posts); the card is never stale before that day and always stale after it, and a waiting card with no due date is an error. Blocked is for cards, people and decisions, never for time.
 
+## Tracker for `@swamp/stagecraft`
+
+`@sntxrr/vikunja-kanban/tracker` is a [stagecraft](https://swamp-club.com/extensions/@swamp/stagecraft) tracker (contract 1): stagecraft's publisher drives it to file, read, comment on, move, relate and assign cards in **one** Vikunja project. It has the two methods every stagecraft tracker has, `describe` and `operate`; stagecraft keeps the delivery ledger, cursor and ticket index.
+
+| Contract | Vikunja |
+|---|---|
+| ticket id / display id | task id (`515`) / task identifier (`#93`, or `ST-3` with a project identifier) |
+| status | a bucket of the project's kanban view, by title; the done bucket marks the task done |
+| type | a label, by title (`create` attaches it) |
+| `parent_of` / `blocked_by` / `duplicate_of` | `subtask` / `blocked` / `duplicateof` (Vikunja keeps the inverse on the other task) |
+| `related_to` | `related`; Vikunja's link is symmetric, so the tracker records which side it was written from (a link made in the UI reads as outgoing from the lower task id) |
+| comment / description | stored as given (markdown) and read back unchanged |
+
+Capabilities: `assign` (users with access to the project, by username). `history` and `pullRequests` are not offered. The relation rules (one parent, no cycles 10 deep, no duplicate chains) are enforced by the tracker, because Vikunja enforces none of them. A task in any other project is `not_found`, so a tracker bound to a test project cannot touch another board.
+
+```sh
+swamp model create @sntxrr/vikunja-kanban/tracker vikunja-test \
+  --global-arg baseUrl=https://vikunja.example.com \
+  --global-arg apiToken=REPLACE_WITH_VAULT_EXPRESSION \
+  --global-arg projectId=<test project id>
+swamp model method run vikunja-test describe
+swamp model create @swamp/stagecraft/publisher vikunja-test-pub \
+  --global-arg tracker=vikunja-test
+# map the factory's status keys to bucket titles in the publisher's `statuses`,
+# name `tracker: { kind: vikunja }` in the factory definition, then:
+swamp workflow run @swamp/stagecraft/conformance --input tracker=vikunja-test-pub \
+  --input statusNames=Doing,Done --input createType=<label> --input missing=999999 \
+  --input user=<username>
+```
+
+The token needs the `tasks`, `tasks_comments`, `tasks_labels`, `tasks_relations`, `tasks_assignees`, `labels` and `projects` (`tasks_by_index`, `views_buckets_tasks`, `projectusers`) permission groups.
+
 ## Resources
 
 - `vikunjaTask` — one record per task: id, title, description, done, priority, labels, due date, timestamps, and (for `new_task`, `move_task` and `close_task`) the `placement` it was moved to (`viewId`, `bucketId`, `bucketTitle`). Writes record it as `task-<id>`; `get_task` (with `bucket`) and a `new_task` duplicate skip record it as `get-<id>`, `list_recent` as `list-<id>`.
